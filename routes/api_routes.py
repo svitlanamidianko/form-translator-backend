@@ -2,12 +2,11 @@ from flask import jsonify, request
 from . import api
 import datetime
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sheets_service import get_sheets_service, initialize_sheets_service
 
-# Test mode - set to True to use mock responses instead of OpenAI
-TEST_MODE = False
-
-if not TEST_MODE:
-    from openai import OpenAI
+from openai import OpenAI
 
 # Initialize OpenAI client - will be created when needed
 client = None
@@ -15,116 +14,121 @@ client = None
 def get_openai_client():
     """Get OpenAI client, creating it if needed"""
     global client
-    if TEST_MODE:
-        return None  # No client needed in test mode
     
     if client is None:
         api_key = os.environ.get('OPENAI_API_KEY')
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is not set")
         
-        # Simple, clean OpenAI client initialization
         try:
-            from openai import OpenAI
-            # Use the most basic initialization possible
             client = OpenAI(api_key=api_key)
-            
         except Exception as e:
             raise ValueError(f"Failed to initialize OpenAI client: {str(e)}")
     
     return client
 
-def get_mock_translation(source_form, target_form, input_text):
-    """Generate a mock translation for testing"""
-    mock_translations = {
-        ('formal', 'poetic'): f"In the realm of verse, thy words become: '{input_text}' transforms into lyrical beauty.",
-        ('casual', 'technical'): f"Technical analysis indicates: The informal input '{input_text}' requires systematic processing.",
-        ('direct', 'metaphorical'): f"Like a river flowing toward the sea, '{input_text}' becomes a journey of meaning.",
-        ('emotional', 'abstract'): f"The philosophical essence of '{input_text}' transcends mere feeling into conceptual reality."
-    }
+# Google Sheet configuration
+SHEET_ID = "1sEnmusmz4X_18emilcsLFIn48nwM6qInLgQKN2rXC5M"
+
+# Initialize sheets service on module load
+def initialize_global_sheets_service():
+    """Initialize the global sheets service with our sheet ID"""
+    try:
+        sheets_service = initialize_sheets_service(SHEET_ID)
+        print(f"✅ Global sheets service initialized with sheet ID: {SHEET_ID}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to initialize global sheets service: {str(e)}")
+        return False
+
+# Initialize on module load
+initialize_global_sheets_service()
+
+def get_current_timestamp():
+    """Utility function to get current timestamp in ISO format"""
+    return datetime.datetime.now().isoformat()
+
+
+def get_form_types():
+    """
+    Get form types from Google Sheet
+    Returns a dictionary in the format: {form_name: form_description}
+    """
+    try:
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            print("❌ Sheets service not available, using fallback")
+            return {}
+        
+        # Use the correct sheet name "forms"
+        range_name = "forms!A:C"
+        result = sheets_service.service.spreadsheets().values().get(
+            spreadsheetId=sheets_service.sheet_id,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        if not values:
+            print("❌ No data found in sheet")
+            return {}
+        
+        # Convert sheet data to dictionary format: {form_name: form_description}
+        form_types = {}
+        
+        # Skip header row and process data
+        for row in values[1:]:  # Skip header row
+            if len(row) >= 3:  # Make sure we have at least 3 columns (ID, Form Name, Description)
+                form_name = row[1].strip() if len(row) > 1 else ""
+                form_description = row[2].strip() if len(row) > 2 else ""
+                
+                if form_name and form_description:
+                    # Create the full description in the same format as before
+                    full_description = f"{form_name} - {form_description}"
+                    form_types[form_name] = full_description
+        
+        print(f"✅ Loaded {len(form_types)} form types from Google Sheet")
+        return form_types
+        
+    except Exception as e:
+        print(f"❌ Error loading form types from sheet: {str(e)}")
+        return {}
+
+def get_prompt_from_sheet(prompt_id: str = "1") -> str:
+    """
+    Get the prompt from the third sheet of Google Sheets
     
-    # Use specific mock if available, otherwise create a generic one
-    key = (source_form, target_form)
-    if key in mock_translations:
-        return mock_translations[key]
-    else:
-        return f"[{target_form.upper()} STYLE] {input_text} [Transformed from {source_form} to {target_form}]"
+    Args:
+        prompt_id: ID of the prompt to retrieve (default: "1")
+        
+    Returns:
+        str: The prompt text from the sheet
+        
+    Raises:
+        ValueError: If prompt is not found in the sheet
+    """
+    try:
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            raise ValueError("Sheets service not available. Cannot retrieve prompt from database.")
+        
+        # Try to get prompt from 'prompt' sheet
+        prompt = sheets_service.get_prompt_from_sheet("prompt", prompt_id)
+        
+        if prompt:
+            print(f"✅ Successfully retrieved prompt with ID '{prompt_id}' from Google Sheets")
+            return prompt
+        else:
+            raise ValueError(f"Prompt with ID '{prompt_id}' not found in 'prompt' sheet. Please add the prompt to your Google Sheets database.")
+            
+    except Exception as e:
+        raise ValueError(f"Failed to retrieve prompt from Google Sheets database: {str(e)}")
 
-# Form type definitions - these define the different "forms" or styles we can translate between
-FORM_TYPES = {
 
-
-    'self-hate': 'Self-Hate - Self-deprecating or self-critical expression',
-    'engineer': 'Engineer - Technical, precise, problem-solving focused',
-    'art': 'Art - Creative, aesthetic, artistic expression',
-    'technology': 'Technology - Tech-focused, digital, innovative language',
-    'russia\'s frame': 'Russia\'s Frame - Russian cultural or political perspective',
-    'ukraine\'s frame': 'Ukraine\'s Frame - Ukrainian cultural or political perspective',
-    'jungian': 'Jungian - Carl Jung\'s analytical psychology perspective',
-    'freudian': 'Freudian - Psychoanalytic, unconscious-focused perspective',
-    'woman\'s': 'Woman\'s - Female perspective or experience',
-    'man\'s': 'Man\'s - Male perspective or experience',
-    'marginalized voice': 'Marginalized Voice - Expression of being diminished for important inquiries',
-    'dismissive response': 'Dismissive Response - Invalidating and deflecting communication style',
-    'eli5': 'ELI5 - Explain Like I\'m 5, simple and easy to understand',
-    'undergrad': 'Undergraduate - Student-level, learning-focused perspective',
-    'tech bro founder': 'Tech Bro Founder - Silicon Valley entrepreneur style',
-    'corporate': 'Corporate - Business, professional, institutional language',
-    'poetic': 'Poetic - Artistic, metaphorical, lyrical expression',
-    'analytical': 'Analytical - Data-driven, logical, systematic approach',
-    'silly': 'Silly - Playful, humorous, lighthearted expression',
-    'people pleaser': 'People Pleaser - Accommodating, conflict-avoiding communication',
-    'boundary queen': 'Boundary Queen - Assertive, limit-setting communication style',
-    'non-dualist': 'Non-Dualist - Unity-focused, transcendent perspective',
-    'logic': 'Logic - Rational, reasoned, systematic thinking',
-    'jhana': 'Jhana - Deep meditative absorption states in Buddhist practice',
-    'vipassana': 'Vipassana - Mindfulness, insight meditation perspective',
-    'christian': 'Christian - Christian religious or spiritual viewpoint',
-    'hinduism': 'Hinduism - Hindu religious or philosophical perspective',
-    'woo woo': 'Woo Woo - Spiritual, mystical, new-age expression',
-    'science': 'Science - Scientific, empirical, evidence-based approach',
-    'stem': 'STEM - Science, Technology, Engineering, Mathematics focused',
-    'mystical': 'Mystical - Spiritual, transcendent, and esoteric experiences',
-    'jhanas + algorithm': 'Jhanas + Algorithm - Meditative states combined with systematic approaches',
-    'affirmations': 'Affirmations - Positive self-talk and empowering statements',
-    'collective unconscious': 'Collective Unconscious - Shared universal psychic material and archetypes',
-   'robot': 'Robot - Mechanical, artificial, non-emotional communication',
-    'nature': 'Nature - Natural, organic, earth-connected expression',
-    'stream': 'Stream - Flowing, continuous, stream-of-consciousness style',
-    'love': 'Love - Love-focused, affectionate, caring expression', 
-    'formal': 'Formal - Professional, structured, and scholarly language',
-    'poetic': 'Poetic - Artistic, metaphorical, lyrical expression',
-    'yoga teacher': 'Yoga Teacher - Mindful, wellness-focused, spiritual guidance style'
-}
-
-@api.route('/test', methods=['GET'])
-def test_route():
-    return jsonify({
-        "message": "Test route working helooo",
-        "service": "API Routes Module",
-        "timestamp": datetime.datetime.now().isoformat()
-    }) 
-
-@api.route('/custom', methods=['GET'])
-def custom_route():
-    return jsonify({
-        "message": "hiiiiii",
-        "service": "API Routes Module",
-        "timestamp": datetime.datetime.now().isoformat()
-    }) 
 
 @api.route('/translate', methods=['POST'])
 def translate_form():
-    """
-    Translate text between different forms/styles using OpenAI
-    
-    Expected request body:
-    {
-        "sourceForm": "formal",
-        "targetForm": "poetic", 
-        "inputText": "Hello, how are you today?"
-    }
-    """
+
     try:
         # Get request data
         data = request.get_json()
@@ -134,117 +138,156 @@ def translate_form():
         # Extract parameters
         source_form = data.get('sourceForm')
         target_form = data.get('targetForm')
-        input_text = data.get('inputText')
+        source_text = data.get('sourceText')
         
         # Validate required parameters
-        if not all([source_form, target_form, input_text]):
+        if not all([source_form, target_form, source_text]):
             return jsonify({
-                "error": "Missing required parameters. Need: sourceForm, targetForm, inputText"
+                "error": "Missing required parameters. Need: sourceForm, targetForm, sourceText"
             }), 400
+        
+        # Get current form types from sheet
+        form_types = get_form_types()
         
         # Validate form types
-        if source_form not in FORM_TYPES:
+        if source_form not in form_types:
             return jsonify({
-                "error": f"Invalid sourceForm '{source_form}'. Valid options: {list(FORM_TYPES.keys())}"
+                "error": f"Invalid sourceForm '{source_form}'. Valid options: {list(form_types.keys())}"
             }), 400
         
-        if target_form not in FORM_TYPES:
+        if target_form not in form_types:
             return jsonify({
-                "error": f"Invalid targetForm '{target_form}'. Valid options: {list(FORM_TYPES.keys())}"
+                "error": f"Invalid targetForm '{target_form}'. Valid options: {list(form_types.keys())}"
             }), 400
         
         # Check if source and target are the same
         if source_form == target_form:
             return jsonify({
-                "translatedText": input_text,
+                "translatedText": source_text,
                 "message": "Source and target forms are identical",
-                "timestamp": datetime.datetime.now().isoformat()
+                "timestamp": get_current_timestamp()
             })
         
-        # Create the prompt for OpenAI
-        source_description = FORM_TYPES[source_form]
-        target_description = FORM_TYPES[target_form]
+        # Get the prompt template from Google Sheets
+        prompt_template = get_prompt_from_sheet()
         
-        prompt = f"""You are a master translator of communication forms and styles. Your task is to transform text from one form of expression to another while preserving the core meaning and intent.
+        # Get form descriptions
+        source_description = form_types[source_form]
+        target_description = form_types[target_form]
+        
+        # Format the prompt with the actual values including form names
+        prompt = prompt_template.format(
+            source_form=source_form,
+            source_description=source_description,
+            target_form=target_form,
+            target_description=target_description,
+            source_text=source_text
+        )
 
-Transform the following text:
-- FROM: {source_description}
-- TO: {target_description}
-
-Original text: "{input_text}"
-
-Instructions:
-1. Preserve the core meaning and intent of the original text
-2. Adapt the style, tone, and expression to match the target form
-3. Be creative and authentic to the target form while staying true to the original meaning
-4. Return only the transformed text, no explanations or additional commentary
-
-Transformed text:"""
-
-        # Make OpenAI API call or use mock response
-        if TEST_MODE:
-            translated_text = get_mock_translation(source_form, target_form, input_text)
-        else:
-            openai_client = get_openai_client()
-            try:
-                # Try new OpenAI client format
-                response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=500,
-                    temperature=0.7
-                )
-                translated_text = response.choices[0].message.content.strip()
-            except AttributeError:
-                # Fallback to older OpenAI format if the client is the module itself
-                response = openai_client.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=500,
-                    temperature=0.7
-                )
-                translated_text = response.choices[0].message.content.strip()
+        # Make OpenAI API call
+        openai_client = get_openai_client()
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.7
+        )
+        translated_text = response.choices[0].message.content.strip()
         
         return jsonify({
             "translatedText": translated_text,
             "sourceForm": source_form,
             "targetForm": target_form,
-            "originalText": input_text,
-            "timestamp": datetime.datetime.now().isoformat()
+            "sourceText": source_text,
+            "timestamp": get_current_timestamp()
         })
         
     except Exception as e:
         return jsonify({
             "error": f"Translation failed: {str(e)}",
-            "timestamp": datetime.datetime.now().isoformat()
+            "timestamp": get_current_timestamp()
         }), 500
 
 @api.route('/forms', methods=['GET'])
 def get_available_forms():
-    """Get list of available form types for translation"""
-    return jsonify({
-        "forms": FORM_TYPES,
-        "count": len(FORM_TYPES),
-        "timestamp": datetime.datetime.now().isoformat()
-    })
+    """Get list of available form types for translation from Google Sheet"""
+    try:
+        form_types = get_form_types()
+        return jsonify({
+            "forms": form_types,
+            "count": len(form_types),
+            "source": "Google Sheet",
+            "timestamp": get_current_timestamp()
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to load forms from Google Sheet: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
 
-@api.route('/createuserentry', methods=['POST'])
-def create_user_entry():
-    data = request.get_json()
-    field_value = data.get('entry')
+
+# Google Sheets Integration Routes
+
+@api.route('/sheets/init', methods=['POST'])
+def initialize_sheets():
+    """
+    Initialize Google Sheets integration with a sheet ID
     
-    #if not data:
-    #     return jsonify({"error": "No data provided"}), 400
+    Expected request body:
+    {
+        "sheet_id": "your_google_sheet_id_here"
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        sheet_id = data.get('sheet_id')
+        if not sheet_id:
+            return jsonify({"error": "sheet_id is required"}), 400
+        
+        # Initialize the sheets service
+        sheets_service = initialize_sheets_service(sheet_id)
+        
+        # Create headers if needed
+        sheets_service.create_headers_if_needed()
+        
+        return jsonify({
+            "message": "Google Sheets integration initialized successfully",
+            "sheet_id": sheet_id,
+            "timestamp": get_current_timestamp()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to initialize Google Sheets: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
 
-    return jsonify({
-        "message": "here is yr" + field_value,
-        "service": "API Routes Module",
-        "timestamp": datetime.datetime.now().isoformat()
-    })
+
+@api.route('/forms/list', methods=['GET'])
+def list_forms():
+    """Get all forms from Google Sheets"""
+    try:
+        sheets_service = get_sheets_service()
+        forms = sheets_service.get_all_forms()
+        
+        return jsonify({
+            "forms": forms,
+            "count": len(forms),
+            "timestamp": get_current_timestamp()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to retrieve forms: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
+
+
+
 

@@ -18,5 +18,11 @@ __pycache__/
 .env
 .env.local
 
+# Google Service Account Credentials
+*.json
+Form Translator DB IAM.json
+credentials.json
+service-account.json
+
 # Logs
 *.log

@@ -30,32 +30,7 @@ def home():
         "timestamp": datetime.datetime.now().isoformat()
     })
 
-# Example CRUD endpoints
-@app.route('/api/items', methods=['GET']) # this is what is called. 
-def get_items():
-    # Example response
-    items = [
-        {"id": 1, "name": "Item 1"},
-        {"id": 2, "name": "Item 2"}
-    ]
-    return jsonify(items)
-
-@app.route('/api/items', methods=['POST'])
-def create_item():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    # Process the data here
-    return jsonify({
-        "message": "Item created",
-        "data": data
-    }), 200
-
-@app.route('/api/items/<int:item_id>', methods=['GET']) #api/items/1
-def get_item(item_id):
-    # Example response
-    return jsonify({"id": item_id, "name": f"Item {item_id}"})
+# All API routes are handled by the blueprint in routes/api_routes.py
 
 # Error handlers
 @app.errorhandler(404)
