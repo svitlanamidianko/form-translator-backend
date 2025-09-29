@@ -719,6 +719,246 @@ class SheetsService:
             print(f"❌ Error updating star count in sheet: {str(e)}")
             raise
 
+    def create_interest_headers_if_needed(self, sheet_name: str = "interest_registered"):
+        """
+        Create headers in the interest tracking sheet if they don't exist
+        Headers: id | what | counter
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Check if headers exist
+            range_name = f"{sheet_name}!A1:C1"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            expected_headers = ['id', 'what', 'counter']
+            
+            # If no headers or wrong headers, create them
+            if not values or values[0] != expected_headers:
+                headers = [expected_headers]
+                
+                body = {
+                    'values': headers
+                }
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A1:C1",
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                print(f"✅ Interest headers created in Google Sheet tab '{sheet_name}'")
+            else:
+                print(f"✅ Interest headers already exist in tab '{sheet_name}'")
+                
+        except HttpError as e:
+            print(f"❌ HTTP Error creating interest headers: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error creating interest headers: {str(e)}")
+            raise
+
+    def initialize_interest_data_if_needed(self, sheet_name: str = "interest_registered"):
+        """
+        Initialize the interest tracking data with default entries if they don't exist
+        Creates entries for 'images' and 'websites' with counter 0
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Ensure headers exist first
+            self.create_interest_headers_if_needed(sheet_name)
+            
+            # Get current data to check if initialization is needed
+            range_name = f"{sheet_name}!A:C"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Check if we have the required entries
+            existing_entries = set()
+            if len(values) > 1:  # Skip header row
+                for row in values[1:]:
+                    if len(row) >= 2:  # Make sure we have at least id and what columns
+                        existing_entries.add(row[1].strip().lower())
+            
+            # Initialize missing entries
+            required_entries = ['images', 'websites']
+            missing_entries = []
+            
+            for entry in required_entries:
+                if entry not in existing_entries:
+                    missing_entries.append(entry)
+            
+            if missing_entries:
+                # Prepare data to append
+                rows_to_add = []
+                for i, entry in enumerate(missing_entries):
+                    # Use simple incremental IDs starting from current row count
+                    current_id = len(values) + i  # This will give us the next available ID
+                    rows_to_add.append([current_id, entry, 0])
+                
+                body = {
+                    'values': rows_to_add
+                }
+                
+                # Append the missing entries
+                self.service.spreadsheets().values().append(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A:C",
+                    valueInputOption='RAW',
+                    insertDataOption='INSERT_ROWS',
+                    body=body
+                ).execute()
+                
+                print(f"✅ Initialized interest data with entries: {missing_entries}")
+            else:
+                print(f"✅ Interest data already initialized with required entries")
+                
+        except HttpError as e:
+            print(f"❌ HTTP Error initializing interest data: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error initializing interest data: {str(e)}")
+            raise
+
+    def increment_interest_counter(self, content_type: str, sheet_name: str = "interest_registered") -> int:
+        """
+        Increment the counter for a specific content type (images or websites)
+        
+        Args:
+            content_type: The type of content ('images' or 'websites')
+            sheet_name: The sheet name to update (default: "interest_registered")
+            
+        Returns:
+            int: New counter value after increment
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Normalize content type to lowercase
+            content_type = content_type.lower().strip()
+            
+            if content_type not in ['images', 'websites']:
+                raise ValueError(f"Invalid content type '{content_type}'. Must be 'images' or 'websites'")
+            
+            # Ensure the sheet and data are properly initialized
+            self.initialize_interest_data_if_needed(sheet_name)
+            
+            # Get all data from the interest sheet
+            range_name = f"{sheet_name}!A:C"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            if not values or len(values) <= 1:  # No data or only headers
+                raise ValueError(f"No data found in {sheet_name} sheet")
+            
+            # Find the row with matching content type
+            for i, row in enumerate(values):
+                if i == 0:  # Skip header row
+                    continue
+                    
+                if len(row) >= 2 and row[1].strip().lower() == content_type:
+                    # Get current counter value
+                    current_counter = 0
+                    if len(row) >= 3:
+                        try:
+                            current_counter = int(row[2])
+                        except (ValueError, TypeError):
+                            current_counter = 0
+                    
+                    # Increment counter
+                    new_counter = current_counter + 1
+                    
+                    # Update counter in column C
+                    row_number = i + 1  # Sheets use 1-based indexing
+                    update_range = f"{sheet_name}!C{row_number}"
+                    
+                    body = {
+                        'values': [[new_counter]]
+                    }
+                    
+                    self.service.spreadsheets().values().update(
+                        spreadsheetId=self.sheet_id,
+                        range=update_range,
+                        valueInputOption='RAW',
+                        body=body
+                    ).execute()
+                    
+                    print(f"✅ Incremented {content_type} counter: {current_counter} → {new_counter}")
+                    return new_counter
+            
+            # If we get here, the content type wasn't found
+            raise ValueError(f"Content type '{content_type}' not found in {sheet_name} sheet")
+            
+        except Exception as e:
+            print(f"❌ Error incrementing interest counter for {content_type}: {str(e)}")
+            raise
+
+    def get_interest_counter(self, content_type: str, sheet_name: str = "interest_registered") -> int:
+        """
+        Get the current counter value for a specific content type
+        
+        Args:
+            content_type: The type of content ('images' or 'websites')
+            sheet_name: The sheet name to read from (default: "interest_registered")
+            
+        Returns:
+            int: Current counter value (0 if not found)
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Normalize content type to lowercase
+            content_type = content_type.lower().strip()
+            
+            # Get all data from the interest sheet
+            range_name = f"{sheet_name}!A:C"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            if not values or len(values) <= 1:  # No data or only headers
+                return 0
+            
+            # Find the row with matching content type
+            for i, row in enumerate(values):
+                if i == 0:  # Skip header row
+                    continue
+                    
+                if len(row) >= 2 and row[1].strip().lower() == content_type:
+                    # Get counter value
+                    if len(row) >= 3:
+                        try:
+                            return int(row[2])
+                        except (ValueError, TypeError):
+                            return 0
+                    return 0
+            
+            # Content type not found
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Error getting interest counter for {content_type}: {str(e)}")
+            return 0
+
 
 # Global instance - will be initialized in the routes
 sheets_service = None

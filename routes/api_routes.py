@@ -88,13 +88,19 @@ def get_form_types():
         
         # Skip header row and process data
         for row in values[1:]:  # Skip header row
-            if len(row) >= 3:  # Make sure we have at least 3 columns (ID, Form Name, Description)
+            if len(row) >= 2:  # Make sure we have at least 2 columns (ID, Form Name)
                 form_name = row[1].strip() if len(row) > 1 else ""
                 form_description = row[2].strip() if len(row) > 2 else ""
                 
-                if form_name and form_description:
-                    # Create the full description in the same format as before
-                    full_description = f"{form_name} - {form_description}"
+                # Include form if it has a name (description is optional)
+                if form_name:
+                    if form_description:
+                        # Create the full description when both name and description exist
+                        full_description = f"{form_name} - {form_description}"
+                    else:
+                        # Use just the form name when no description is provided
+                        full_description = form_name
+                    
                     form_types[form_name] = full_description
         
         print(f"✅ Loaded {len(form_types)} form types from Google Sheet")
@@ -490,6 +496,66 @@ def update_star():
     except Exception as e:
         return jsonify({
             "error": f"Failed to update star count: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
+
+
+# Interest Tracking Routes
+
+@api.route('/interest', methods=['POST'])
+def track_interest():
+    """
+    Track user interest by incrementing counters for content types
+    
+    Expected request body:
+    {
+        "contentType": "images" | "websites",
+        "timestamp": "2025-01-15T10:30:45.123Z"  // optional
+    }
+    
+    Returns:
+        JSON response with success status and updated counter
+    """
+    try:
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        content_type = data.get('contentType')
+        timestamp = data.get('timestamp', get_current_timestamp())
+        
+        # Validate required parameters
+        if not content_type:
+            return jsonify({"error": "contentType is required"}), 400
+        
+        # Validate content type
+        if content_type.lower() not in ['images', 'websites']:
+            return jsonify({
+                "error": f"Invalid contentType '{content_type}'. Must be 'images' or 'websites'"
+            }), 400
+        
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({
+                "error": "Sheets service not available",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+        # Increment the interest counter
+        new_count = sheets_service.increment_interest_counter(content_type)
+        
+        return jsonify({
+            "success": True,
+            "message": "Interest tracked successfully",
+            "totalInterest": new_count,
+            "contentType": content_type,
+            "timestamp": timestamp
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to track interest: {str(e)}",
             "timestamp": get_current_timestamp()
         }), 500
 
