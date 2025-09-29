@@ -15,8 +15,9 @@ app.register_blueprint(api)
 
 # Configuration
 class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') 
-    DEBUG =  os.environ.get('DEBUG') 
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production') 
+    DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
+    FLASK_ENV = os.environ.get('FLASK_ENV', 'development')
 
 app.config.from_object(Config)
 
@@ -55,4 +56,12 @@ def bad_request_error(error):
     }), 400
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=7777, debug=True)
+    # Get port from environment variable (for production) or use default for localhost
+    port = int(os.environ.get('PORT', 7777))
+    debug_mode = app.config['DEBUG']
+    
+    print(f"🚀 Starting Flask app on port {port}")
+    print(f"🔧 Debug mode: {debug_mode}")
+    print(f"🌍 Environment: {app.config['FLASK_ENV']}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)

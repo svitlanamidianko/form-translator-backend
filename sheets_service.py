@@ -37,18 +37,29 @@ class SheetsService:
     def _initialize_service(self):
         """Initialize the Google Sheets API service"""
         try:
-            # Load credentials from JSON file
-            if not os.path.exists(self.credentials_file):
-                raise FileNotFoundError(f"Credentials file not found: {self.credentials_file}")
-            
             # Define the scope for Google Sheets API
             scopes = ['https://www.googleapis.com/auth/spreadsheets']
             
-            # Create credentials object
-            credentials = Credentials.from_service_account_file(
-                self.credentials_file, 
-                scopes=scopes
-            )
+            # Try to load credentials from environment variable first (for production)
+            credentials_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+            if credentials_json:
+                # Load credentials from JSON string (production)
+                credentials_info = json.loads(credentials_json)
+                credentials = Credentials.from_service_account_info(
+                    credentials_info, 
+                    scopes=scopes
+                )
+                print("✅ Using Google credentials from environment variable")
+            else:
+                # Load credentials from JSON file (development)
+                if not os.path.exists(self.credentials_file):
+                    raise FileNotFoundError(f"Credentials file not found: {self.credentials_file}")
+                
+                credentials = Credentials.from_service_account_file(
+                    self.credentials_file, 
+                    scopes=scopes
+                )
+                print(f"✅ Using Google credentials from file: {self.credentials_file}")
             
             # Build the service
             self.service = build('sheets', 'v4', credentials=credentials)
@@ -351,6 +362,362 @@ class SheetsService:
         except Exception as e:
             print(f"❌ Error getting prompt: {str(e)}")
             return None
+
+    def get_history_data(self, sheet_name: str = "history") -> List[Dict[str, str]]:
+        """
+        Get all history data from the Google Sheet, sorted by newest first
+        
+        Args:
+            sheet_name: Name of the history sheet tab (default: "history")
+            
+        Returns:
+            List of dictionaries containing history data, sorted by datetime descending
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Get all data from the history sheet
+            # Columns: A=id, B=stars_count, C=source_form, D=source_form_id, 
+            #         E=source_text, F=target_form, G=target_form_id, H=target_text, I=datetime
+            range_name = f"{sheet_name}!A:I"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            if not values:
+                print(f"❌ No data found in {sheet_name}")
+                return []
+            
+            # Skip header row and convert to list of dictionaries
+            history_items = []
+            for row in values[1:]:  # Skip header row
+                # Handle rows with missing columns - ensure we have at least the essential columns
+                if len(row) >= 6:  # At minimum we need id, source_form, source_text, target_form, target_text, datetime
+                    history_item = {
+                        'id': row[0] if len(row) > 0 else "",
+                        'stars_count': int(row[1]) if len(row) > 1 and row[1].isdigit() else 0,
+                        'source_form': row[2] if len(row) > 2 else "",
+                        'source_form_id': row[3] if len(row) > 3 else "",
+                        'source_text': row[4] if len(row) > 4 else "",
+                        'target_form': row[5] if len(row) > 5 else "",
+                        'target_form_id': row[6] if len(row) > 6 else "",
+                        'target_text': row[7] if len(row) > 7 else "",
+                        'datetime': row[8] if len(row) > 8 else ""
+                    }
+                    history_items.append(history_item)
+            
+            # Sort by datetime in descending order (newest first)
+            # We'll parse the datetime strings to sort them properly
+            from datetime import datetime as dt
+            
+            def parse_datetime(date_str):
+                """Parse datetime string, return a datetime object for sorting"""
+                if not date_str:
+                    return dt.min  # Put empty dates at the end
+                try:
+                    # Try different datetime formats
+                    for fmt in ['%m/%d/%Y', '%Y-%m-%d', '%m/%d/%Y %H:%M:%S', '%Y-%m-%d %H:%M:%S']:
+                        try:
+                            return dt.strptime(date_str, fmt)
+                        except ValueError:
+                            continue
+                    # If all formats fail, try to parse ISO format
+                    return dt.fromisoformat(date_str.replace('Z', '+00:00'))
+                except:
+                    return dt.min  # Put unparseable dates at the end
+            
+            # Sort by star count descending (highest first), then by datetime descending (newest first)
+            history_items.sort(key=lambda x: (x['stars_count'], parse_datetime(x['datetime'])), reverse=True)
+            
+            print(f"✅ Retrieved {len(history_items)} history items from Google Sheet")
+            return history_items
+            
+        except HttpError as e:
+            print(f"❌ HTTP Error getting history data: {e}")
+            return []
+        except Exception as e:
+            print(f"❌ Error getting history data: {str(e)}")
+            return []
+
+    def create_history_headers_if_needed(self, sheet_name: str = "history"):
+        """
+        Create headers in the history sheet if they don't exist
+        Headers: id | stars_count | source_form | source_form_id | source_text | target_form | target_form_id | target_text | datetime
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Check if headers exist
+            range_name = f"{sheet_name}!A1:I1"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            expected_headers = ['id', 'stars_count', 'source_form', 'source_form_id', 'source_text', 'target_form', 'target_form_id', 'target_text', 'datetime']
+            
+            # If no headers or wrong headers, create them
+            if not values or values[0] != expected_headers:
+                headers = [expected_headers]
+                
+                body = {
+                    'values': headers
+                }
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A1:I1",
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                print(f"✅ History headers created in Google Sheet tab '{sheet_name}'")
+            else:
+                print(f"✅ History headers already exist in tab '{sheet_name}'")
+                
+        except HttpError as e:
+            print(f"❌ HTTP Error creating history headers: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error creating history headers: {str(e)}")
+            raise
+
+    def add_translation_to_history(self, 
+                                   source_form: str, 
+                                   source_text: str, 
+                                   target_form: str, 
+                                   target_text: str,
+                                   source_form_id: str = "",
+                                   target_form_id: str = "",
+                                   stars_count: int = 0,
+                                   sheet_name: str = "history") -> bool:
+        """
+        Add a translation record to the history sheet
+        
+        Args:
+            source_form: Name of the source form type
+            source_text: Original text that was translated
+            target_form: Name of the target form type
+            target_text: The translated result
+            source_form_id: ID of the source form (optional)
+            target_form_id: ID of the target form (optional)
+            stars_count: Number of stars/likes for this translation (default: 0)
+            sheet_name: Name of the history sheet tab (default: "history")
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Ensure history headers exist
+            self.create_history_headers_if_needed(sheet_name)
+            
+            # Generate unique ID for this translation (timestamp-based)
+            from datetime import datetime
+            import uuid
+            
+            # Create a short unique ID
+            translation_id = str(uuid.uuid4())[:8]
+            
+            # Format datetime as a readable string
+            current_datetime = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+            
+            # Prepare the data to append
+            # Columns: id | stars_count | source_form | source_form_id | source_text | target_form | target_form_id | target_text | datetime
+            values = [[
+                translation_id,
+                stars_count,
+                source_form,
+                source_form_id,
+                source_text,
+                target_form,
+                target_form_id,
+                target_text,
+                current_datetime
+            ]]
+            
+            body = {
+                'values': values
+            }
+            
+            # Append the data to the history sheet
+            result = self.service.spreadsheets().values().append(
+                spreadsheetId=self.sheet_id,
+                range=f"{sheet_name}!A:I",
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            ).execute()
+            
+            print(f"✅ Translation logged to history: {source_form} → {target_form} (ID: {translation_id})")
+            return True
+            
+        except HttpError as e:
+            print(f"❌ HTTP Error adding translation to history: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error adding translation to history: {str(e)}")
+            return False
+
+    def get_star_count(self, translation_id: str, sheet_name: str = "history") -> int:
+        """
+        Get the current star count for a translation
+        
+        Args:
+            translation_id: The ID of the translation to get star count for
+            sheet_name: The sheet name to read from (default: "history")
+            
+        Returns:
+            int: Current star count (0 if translation not found)
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Get all data from the history sheet (only need columns A and B for star count)
+            range_name = f"{sheet_name}!A:B"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            if not values:
+                return 0
+            
+            # Find the row with matching translation ID (column A)
+            for i, row in enumerate(values):
+                if len(row) > 0 and row[0] == translation_id:
+                    # Star count is in column B (index 1)
+                    if len(row) > 1:
+                        try:
+                            return int(row[1])
+                        except (ValueError, TypeError):
+                            return 0
+                    return 0
+            
+            # Translation ID not found
+            return 0
+            
+        except Exception as e:
+            print(f"❌ Error getting star count for {translation_id}: {str(e)}")
+            return 0
+
+    def increment_star_count(self, translation_id: str, sheet_name: str = "history") -> int:
+        """
+        Increment the star count for a translation
+        
+        Args:
+            translation_id: The ID of the translation to increment stars for
+            sheet_name: The sheet name to update (default: "history")
+            
+        Returns:
+            int: New star count after increment
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Get current star count
+            current_count = self.get_star_count(translation_id, sheet_name)
+            new_count = current_count + 1
+            
+            # Update the star count in the sheet
+            self._update_star_count_in_sheet(translation_id, new_count, sheet_name)
+            
+            print(f"✅ Incremented star count for {translation_id}: {current_count} → {new_count}")
+            return new_count
+            
+        except Exception as e:
+            print(f"❌ Error incrementing star count for {translation_id}: {str(e)}")
+            # Return current count as fallback
+            return self.get_star_count(translation_id, sheet_name)
+
+    def decrement_star_count(self, translation_id: str, sheet_name: str = "history") -> int:
+        """
+        Decrement the star count for a translation (minimum 0)
+        
+        Args:
+            translation_id: The ID of the translation to decrement stars for
+            sheet_name: The sheet name to update (default: "history")
+            
+        Returns:
+            int: New star count after decrement
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Get current star count
+            current_count = self.get_star_count(translation_id, sheet_name)
+            new_count = max(0, current_count - 1)  # Don't go below 0
+            
+            # Update the star count in the sheet
+            self._update_star_count_in_sheet(translation_id, new_count, sheet_name)
+            
+            print(f"✅ Decremented star count for {translation_id}: {current_count} → {new_count}")
+            return new_count
+            
+        except Exception as e:
+            print(f"❌ Error decrementing star count for {translation_id}: {str(e)}")
+            # Return current count as fallback
+            return self.get_star_count(translation_id, sheet_name)
+
+    def _update_star_count_in_sheet(self, translation_id: str, new_count: int, sheet_name: str = "history"):
+        """
+        Helper method to update star count in the Google Sheet
+        
+        Args:
+            translation_id: The ID of the translation to update
+            new_count: The new star count value
+            sheet_name: The sheet name to update
+        """
+        try:
+            # Get all data from the history sheet (only need columns A and B)
+            range_name = f"{sheet_name}!A:B"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            if not values:
+                raise ValueError(f"No data found in {sheet_name} sheet")
+            
+            # Find the row with matching translation ID
+            for i, row in enumerate(values):
+                if len(row) > 0 and row[0] == translation_id:
+                    # Update star count in column B (index 1)
+                    row_number = i + 1  # Sheets use 1-based indexing
+                    update_range = f"{sheet_name}!B{row_number}"
+                    
+                    body = {
+                        'values': [[new_count]]
+                    }
+                    
+                    self.service.spreadsheets().values().update(
+                        spreadsheetId=self.sheet_id,
+                        range=update_range,
+                        valueInputOption='RAW',
+                        body=body
+                    ).execute()
+                    
+                    return
+            
+            # If we get here, the translation ID wasn't found
+            raise ValueError(f"Translation ID {translation_id} not found in {sheet_name} sheet")
+            
+        except Exception as e:
+            print(f"❌ Error updating star count in sheet: {str(e)}")
+            raise
 
 
 # Global instance - will be initialized in the routes

@@ -6,7 +6,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sheets_service import get_sheets_service, initialize_sheets_service
 
-from openai import OpenAI
+import openai
 
 # Initialize OpenAI client - will be created when needed
 client = None
@@ -21,9 +21,19 @@ def get_openai_client():
             raise ValueError("OPENAI_API_KEY environment variable is not set")
         
         try:
-            client = OpenAI(api_key=api_key)
+            # Use the older openai.api_key method which is more stable
+            openai.api_key = api_key
+            client = openai
+            print("✅ OpenAI client initialized successfully with legacy method")
         except Exception as e:
-            raise ValueError(f"Failed to initialize OpenAI client: {str(e)}")
+            # Fallback to new method if legacy doesn't work
+            try:
+                from openai import OpenAI
+                # Create a minimal client without any optional parameters
+                client = OpenAI(api_key=api_key)
+                print("✅ OpenAI client initialized successfully with new method")
+            except Exception as new_e:
+                raise ValueError(f"Failed to initialize OpenAI client: {str(new_e)}")
     
     return client
 
@@ -186,16 +196,74 @@ def translate_form():
 
         # Make OpenAI API call
         openai_client = get_openai_client()
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.7
-        )
+        
+        # Handle both legacy and new OpenAI client methods
+        if hasattr(openai_client, 'chat') and hasattr(openai_client.chat, 'completions'):
+            # New OpenAI client method
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.7
+            )
+        else:
+            # Legacy OpenAI method
+            response = openai_client.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert in transforming text between different forms of expression while preserving meaning."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.7
+            )
         translated_text = response.choices[0].message.content.strip()
+        
+        # Remove unwanted quotation marks from the beginning and end
+        # This handles both single and double quotes that OpenAI sometimes adds
+        def clean_quotes(text):
+            """Remove wrapping quotes while preserving quotes that are part of the content"""
+            text = text.strip()
+            
+            # Remove double quotes that wrap the entire text
+            if text.startswith('"') and text.endswith('"') and len(text) > 2:
+                # Check if removing these quotes leaves a valid sentence
+                inner_text = text[1:-1].strip()
+                if inner_text:  # Only remove if there's content inside
+                    text = inner_text
+            
+            # Remove single quotes that wrap the entire text
+            elif text.startswith("'") and text.endswith("'") and len(text) > 2:
+                inner_text = text[1:-1].strip()
+                if inner_text:
+                    text = inner_text
+            
+            return text
+        
+        translated_text = clean_quotes(translated_text)
+        
+        # Log the translation to history database
+        try:
+            sheets_service = get_sheets_service()
+            if sheets_service:
+                success = sheets_service.add_translation_to_history(
+                    source_form=source_form,
+                    source_text=source_text,
+                    target_form=target_form,
+                    target_text=translated_text
+                )
+                if success:
+                    print(f"✅ Translation logged to history database")
+                else:
+                    print(f"⚠️ Failed to log translation to history database")
+            else:
+                print(f"⚠️ Sheets service not available, translation not logged to history")
+        except Exception as e:
+            print(f"⚠️ Error logging translation to history: {str(e)}")
+            # Continue with the response even if history logging fails
         
         return jsonify({
             "translatedText": translated_text,
@@ -289,5 +357,139 @@ def list_forms():
         }), 500
 
 
+@api.route('/history', methods=['GET'])
+def get_history():
+    """
+    Get translation history from Google Sheets, sorted by star count first (highest to lowest), then by newest first
+    
+    Returns:
+        JSON response containing history data with:
+        - id: unique identifier
+        - stars_count: number of stars for this translation
+        - source_form: the original form type
+        - source_form_id: ID of the source form
+        - source_text: original text (source translation)
+        - target_form: the target form type
+        - target_form_id: ID of the target form  
+        - target_text: translated text (target translation)
+        - datetime: when the translation was created
+    """
+    try:
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({
+                "error": "Sheets service not available",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+        # Get history data from the "history" sheet
+        history_data = sheets_service.get_history_data("history")
+        
+        return jsonify({
+            "history": history_data,
+            "count": len(history_data),
+            "source": "Google Sheet - history tab",
+            "sorted_by": "star count descending (highest first), then datetime descending (newest first)",
+            "timestamp": get_current_timestamp()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to retrieve history: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
 
+
+# Star Management Routes
+
+@api.route('/star/<translation_id>', methods=['GET'])
+def get_star_count(translation_id):
+    """
+    Get star count for a specific translation
+    
+    Args:
+        translation_id: The ID of the translation to get star count for
+        
+    Returns:
+        JSON response with translation_id and total_stars count
+    """
+    try:
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({
+                "error": "Sheets service not available",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+        # Get star count from sheets service
+        star_count = sheets_service.get_star_count(translation_id)
+        
+        return jsonify({
+            "translationId": translation_id,
+            "totalStars": star_count,
+            "timestamp": get_current_timestamp()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to get star count: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
+
+
+@api.route('/star', methods=['POST'])
+def update_star():
+    """
+    Update star count for a translation (star or unstar)
+    
+    Expected request body:
+    {
+        "translationId": "some_id",
+        "action": "star" | "unstar"
+    }
+    
+    Returns:
+        JSON response with updated star count
+    """
+    try:
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        translation_id = data.get('translationId')
+        action = data.get('action')
+        
+        # Validate required parameters
+        if not translation_id:
+            return jsonify({"error": "translationId is required"}), 400
+        
+        if action not in ['star', 'unstar']:
+            return jsonify({"error": "action must be 'star' or 'unstar'"}), 400
+        
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({
+                "error": "Sheets service not available",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+        # Update star count based on action
+        if action == 'star':
+            new_count = sheets_service.increment_star_count(translation_id)
+        else:  # unstar
+            new_count = sheets_service.decrement_star_count(translation_id)
+        
+        return jsonify({
+            "translationId": translation_id,
+            "action": action,
+            "totalStars": new_count,
+            "timestamp": get_current_timestamp()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to update star count: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
 
