@@ -59,10 +59,13 @@ def get_current_timestamp():
     return datetime.datetime.now().isoformat()
 
 
-def get_form_types():
+def get_form_types(include_user_submitted: bool = False):
     """
     Get form types from Google Sheet
     Returns a dictionary in the format: {form_name: form_description}
+    
+    Args:
+        include_user_submitted: Whether to include user-submitted forms (default: False)
     """
     try:
         sheets_service = get_sheets_service()
@@ -70,40 +73,82 @@ def get_form_types():
             print("❌ Sheets service not available, using fallback")
             return {}
         
-        # Use the correct sheet name "forms"
-        range_name = "forms!A:C"
-        result = sheets_service.service.spreadsheets().values().get(
-            spreadsheetId=sheets_service.sheet_id,
-            range=range_name
-        ).execute()
+        # Get forms using the updated method
+        forms = sheets_service.get_all_forms("forms", include_user_submitted=include_user_submitted)
         
-        values = result.get('values', [])
-        
-        if not values:
-            print("❌ No data found in sheet")
+        if not forms:
+            print("❌ No forms found in sheet")
             return {}
         
-        # Convert sheet data to dictionary format: {form_name: form_description}
+        # Convert to dictionary format: {form_name: form_description}
         form_types = {}
         
-        # Skip header row and process data
-        for row in values[1:]:  # Skip header row
-            if len(row) >= 2:  # Make sure we have at least 2 columns (ID, Form Name)
-                form_name = row[1].strip() if len(row) > 1 else ""
-                form_description = row[2].strip() if len(row) > 2 else ""
+        for form in forms:
+            form_name = form.get('form_name', '').strip()
+            form_description = form.get('form_description', '').strip()
+            
+            # Include form if it has a name (description is optional)
+            if form_name:
+                if form_description:
+                    # Create the full description when both name and description exist
+                    full_description = f"{form_name} - {form_description}"
+                else:
+                    # Use just the form name when no description is provided
+                    full_description = form_name
                 
-                # Include form if it has a name (description is optional)
-                if form_name:
-                    if form_description:
-                        # Create the full description when both name and description exist
-                        full_description = f"{form_name} - {form_description}"
-                    else:
-                        # Use just the form name when no description is provided
-                        full_description = form_name
-                    
-                    form_types[form_name] = full_description
+                form_types[form_name] = full_description
         
-        print(f"✅ Loaded {len(form_types)} form types from Google Sheet")
+        print(f"✅ Loaded {len(form_types)} form types from Google Sheet (include_user_submitted: {include_user_submitted})")
+        return form_types
+        
+    except Exception as e:
+        print(f"❌ Error loading form types from sheet: {str(e)}")
+        return {}
+
+def get_form_types_with_categories(include_user_submitted: bool = False):
+    """
+    Get form types from Google Sheet with categories included
+    Returns a dictionary in the format: {form_name: {description: str, category: str}}
+    
+    Args:
+        include_user_submitted: Whether to include user-submitted forms (default: False)
+    """
+    try:
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            print("❌ Sheets service not available, using fallback")
+            return {}
+        
+        # Get forms using the updated method
+        forms = sheets_service.get_all_forms("forms", include_user_submitted=include_user_submitted)
+        
+        if not forms:
+            print("❌ No forms found in sheet")
+            return {}
+        
+        # Convert to dictionary format: {form_name: {description: str, category: str}}
+        form_types = {}
+        
+        for form in forms:
+            form_name = form.get('form_name', '').strip()
+            form_description = form.get('form_description', '').strip()
+            category = form.get('category', '').strip()
+            
+            # Include form if it has a name (description is optional)
+            if form_name:
+                if form_description:
+                    # Create the full description when both name and description exist
+                    full_description = f"{form_name} - {form_description}"
+                else:
+                    # Use just the form name when no description is provided
+                    full_description = form_name
+                
+                form_types[form_name] = {
+                    "description": full_description,
+                    "category": category if category else None
+                }
+        
+        print(f"✅ Loaded {len(form_types)} form types with categories from Google Sheet (include_user_submitted: {include_user_submitted})")
         return form_types
         
     except Exception as e:
@@ -148,33 +193,71 @@ def translate_form():
     try:
         # Get request data
         data = request.get_json()
+        print(f"🔍 DEBUG: Received request data: {data}")
         if not data:
             return jsonify({"error": "No data provided"}), 400
         
         # Extract parameters
         source_form = data.get('sourceForm')
         target_form = data.get('targetForm')
-        source_text = data.get('sourceText')
+        # Accept both 'sourceText' and 'inputText' for backward compatibility
+        source_text = data.get('sourceText') or data.get('inputText')
+        source_form_description = data.get('sourceFormDescription', '')
+        target_form_description = data.get('targetFormDescription', '')
         
         # Validate required parameters
         if not all([source_form, target_form, source_text]):
             return jsonify({
-                "error": "Missing required parameters. Need: sourceForm, targetForm, sourceText"
+                "error": "Missing required parameters. Need: sourceForm, targetForm, sourceText (or inputText)"
             }), 400
         
-        # Get current form types from sheet
-        form_types = get_form_types()
+        # Get current form types from sheet (including user-submitted forms for validation)
+        form_types = get_form_types(include_user_submitted=True)
         
-        # Validate form types
+        # Handle custom forms - add them to the sheet if they don't exist
+        sheets_service = get_sheets_service()
+        
+        # Check and add source form if it's custom
         if source_form not in form_types:
-            return jsonify({
-                "error": f"Invalid sourceForm '{source_form}'. Valid options: {list(form_types.keys())}"
-            }), 400
+            print(f"🔍 DEBUG: Source form '{source_form}' not found in existing forms")
+            print(f"🔍 DEBUG: Source form description provided: '{source_form_description}'")
+            # Use provided description or default to form name
+            description = source_form_description or f"Custom form: {source_form}"
+            
+            # This is a custom form, add it to the sheet
+            success = sheets_service.add_custom_form(
+                form_name=source_form,
+                form_description=description
+            )
+            if success:
+                print(f"✅ Added custom source form: {source_form}")
+                # Update form_types to include the new form
+                form_types[source_form] = f"{source_form} - {description}"
+            else:
+                print(f"⚠️ Failed to add custom source form: {source_form}")
+                error_msg = f"Failed to create custom sourceForm '{source_form}'. Please try again."
+                return jsonify({"error": error_msg}), 500
         
+        # Check and add target form if it's custom
         if target_form not in form_types:
-            return jsonify({
-                "error": f"Invalid targetForm '{target_form}'. Valid options: {list(form_types.keys())}"
-            }), 400
+            print(f"🔍 DEBUG: Target form '{target_form}' not found in existing forms")
+            print(f"🔍 DEBUG: Target form description provided: '{target_form_description}'")
+            # Use provided description or default to form name
+            description = target_form_description or f"Custom form: {target_form}"
+            
+            # This is a custom form, add it to the sheet
+            success = sheets_service.add_custom_form(
+                form_name=target_form,
+                form_description=description
+            )
+            if success:
+                print(f"✅ Added custom target form: {target_form}")
+                # Update form_types to include the new form
+                form_types[target_form] = f"{target_form} - {description}"
+            else:
+                print(f"⚠️ Failed to add custom target form: {target_form}")
+                error_msg = f"Failed to create custom targetForm '{target_form}'. Please try again."
+                return jsonify({"error": error_msg}), 500
         
         # Check if source and target are the same
         if source_form == target_form:
@@ -287,13 +370,15 @@ def translate_form():
 
 @api.route('/forms', methods=['GET'])
 def get_available_forms():
-    """Get list of available form types for translation from Google Sheet"""
+    """Get list of available form types for translation from Google Sheet (excludes user-submitted forms)"""
     try:
-        form_types = get_form_types()
+        # Only return non-user-submitted forms for the UI dropdown
+        form_types = get_form_types_with_categories(include_user_submitted=False)
         return jsonify({
             "forms": form_types,
             "count": len(form_types),
             "source": "Google Sheet",
+            "note": "User-submitted custom forms are excluded from this list",
             "timestamp": get_current_timestamp()
         })
     except Exception as e:
@@ -345,14 +430,18 @@ def initialize_sheets():
 
 @api.route('/forms/list', methods=['GET'])
 def list_forms():
-    """Get all forms from Google Sheets"""
+    """Get all forms from Google Sheets with optional filtering"""
     try:
+        # Get query parameter for including user-submitted forms
+        include_user_submitted = request.args.get('include_user_submitted', 'false').lower() == 'true'
+        
         sheets_service = get_sheets_service()
-        forms = sheets_service.get_all_forms()
+        forms = sheets_service.get_all_forms("forms", include_user_submitted=include_user_submitted)
         
         return jsonify({
             "forms": forms,
             "count": len(forms),
+            "include_user_submitted": include_user_submitted,
             "timestamp": get_current_timestamp()
         })
         

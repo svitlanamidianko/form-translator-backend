@@ -3,9 +3,11 @@ Google Sheets Service for Form Translator Backend
 
 This module handles all Google Sheets operations for storing forms data.
 The sheet structure is:
-- Column A: Form Name
-- Column B: Form Description  
-- Column C: Category
+- Column A: id (number)
+- Column B: form name
+- Column C: form description  
+- Column D: category
+- Column E: user_submitted (boolean)
 """
 
 import os
@@ -74,27 +76,28 @@ class SheetsService:
         self.sheet_id = sheet_id
         print(f"📊 Sheet ID set to: {sheet_id}")
     
-    def create_headers_if_needed(self, sheet_name: str = "Sheet1"):
+    def create_headers_if_needed(self, sheet_name: str = "forms"):
         """
         Create headers in the sheet if they don't exist
-        Headers: Form Name | Form Description | Category
+        Headers: id | form name | form description | category | user_submitted
         """
         try:
             if not self.sheet_id:
                 raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
             
             # Check if headers exist
-            range_name = f"{sheet_name}!A1:C1"
+            range_name = f"{sheet_name}!A1:E1"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
                 range=range_name
             ).execute()
             
             values = result.get('values', [])
+            expected_headers = ['id', 'form name', 'form description', 'category', 'user_submitted']
             
             # If no headers or wrong headers, create them
-            if not values or values[0] != ['Form Name', 'Form Description', 'Category']:
-                headers = [['Form Name', 'Form Description', 'Category']]
+            if not values or values[0] != expected_headers:
+                headers = [expected_headers]
                 
                 body = {
                     'values': headers
@@ -102,7 +105,7 @@ class SheetsService:
                 
                 self.service.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
-                    range=f"{sheet_name}!A1:C1",
+                    range=f"{sheet_name}!A1:E1",
                     valueInputOption='RAW',
                     body=body
                 ).execute()
@@ -118,7 +121,7 @@ class SheetsService:
             print(f"❌ Error creating headers: {str(e)}")
             raise
     
-    def add_form(self, form_name: str, form_description: str, category: str = "", sheet_name: str = "Sheet1") -> bool:
+    def add_form(self, form_name: str, form_description: str, category: str = "", user_submitted: bool = False, sheet_name: str = "forms") -> bool:
         """
         Add a new form to the Google Sheet
         
@@ -126,7 +129,8 @@ class SheetsService:
             form_name: Name of the form
             form_description: Description of the form
             category: Category of the form (optional)
-            sheet_name: Name of the sheet tab (default: "Sheet1")
+            user_submitted: Whether this is a user-submitted custom form (default: False)
+            sheet_name: Name of the sheet tab (default: "forms")
             
         Returns:
             bool: True if successful, False otherwise
@@ -138,8 +142,11 @@ class SheetsService:
             # Ensure headers exist
             self.create_headers_if_needed(sheet_name)
             
+            # Get next form ID
+            next_id = self._get_next_form_id(sheet_name)
+            
             # Prepare the data to append
-            values = [[form_name, form_description, category]]
+            values = [[next_id, form_name, form_description, category, user_submitted]]
             
             body = {
                 'values': values
@@ -148,13 +155,13 @@ class SheetsService:
             # Append the data to the sheet
             result = self.service.spreadsheets().values().append(
                 spreadsheetId=self.sheet_id,
-                range=f"{sheet_name}!A:C",
+                range=f"{sheet_name}!A:E",
                 valueInputOption='RAW',
                 insertDataOption='INSERT_ROWS',
                 body=body
             ).execute()
             
-            print(f"✅ Form '{form_name}' added to Google Sheet")
+            print(f"✅ Form '{form_name}' added to Google Sheet (ID: {next_id}, User_submitted: {user_submitted})")
             return True
             
         except HttpError as e:
@@ -164,12 +171,52 @@ class SheetsService:
             print(f"❌ Error adding form: {str(e)}")
             return False
     
-    def get_all_forms(self, sheet_name: str = "Sheet1") -> List[Dict[str, str]]:
+    def _get_next_form_id(self, sheet_name: str = "forms") -> int:
+        """
+        Get the next available form ID
+        
+        Args:
+            sheet_name: Name of the sheet tab
+            
+        Returns:
+            int: Next available form ID
+        """
+        try:
+            # Get all data from column A (Form ID)
+            range_name = f"{sheet_name}!A:A"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            if not values or len(values) <= 1:  # No data or only headers
+                return 1
+            
+            # Find the highest ID
+            max_id = 0
+            for row in values[1:]:  # Skip header row
+                if len(row) > 0 and row[0]:
+                    try:
+                        form_id = int(row[0])
+                        max_id = max(max_id, form_id)
+                    except (ValueError, TypeError):
+                        continue
+            
+            return max_id + 1
+            
+        except Exception as e:
+            print(f"❌ Error getting next form ID: {str(e)}")
+            return 1
+    
+    def get_all_forms(self, sheet_name: str = "forms", include_user_submitted: bool = True) -> List[Dict[str, str]]:
         """
         Get all forms from the Google Sheet
         
         Args:
-            sheet_name: Name of the sheet tab (default: "Sheet1")
+            sheet_name: Name of the sheet tab (default: "forms")
+            include_user_submitted: Whether to include user-submitted forms (default: True)
             
         Returns:
             List of dictionaries containing form data
@@ -179,7 +226,7 @@ class SheetsService:
                 raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
             
             # Get all data from the sheet
-            range_name = f"{sheet_name}!A:C"
+            range_name = f"{sheet_name}!A:E"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
                 range=range_name
@@ -194,17 +241,29 @@ class SheetsService:
             forms = []
             for row in values[1:]:  # Skip header row
                 # Handle rows with missing columns
-                form_name = row[0] if len(row) > 0 else ""
-                form_description = row[1] if len(row) > 1 else ""
-                category = row[2] if len(row) > 2 else ""
+                form_id = row[0] if len(row) > 0 else ""
+                form_name = row[1] if len(row) > 1 else ""
+                form_description = row[2] if len(row) > 2 else ""
+                category = row[3] if len(row) > 3 else ""
+                user_submitted = row[4] if len(row) > 4 else False
+                
+                # Convert user_submitted to boolean
+                if isinstance(user_submitted, str):
+                    user_submitted = user_submitted.lower() in ['true', '1', 'yes']
+                
+                # Filter based on include_user_submitted flag
+                if not include_user_submitted and user_submitted:
+                    continue
                 
                 forms.append({
+                    'form_id': form_id,
                     'form_name': form_name,
                     'form_description': form_description,
-                    'category': category
+                    'category': category,
+                    'user_submitted': user_submitted
                 })
             
-            print(f"✅ Retrieved {len(forms)} forms from Google Sheet")
+            print(f"✅ Retrieved {len(forms)} forms from Google Sheet (include_user_submitted: {include_user_submitted})")
             return forms
             
         except HttpError as e:
@@ -214,7 +273,57 @@ class SheetsService:
             print(f"❌ Error getting forms: {str(e)}")
             return []
     
-    def update_form(self, row_number: int, form_name: str, form_description: str, category: str = "", sheet_name: str = "Sheet1") -> bool:
+    def form_exists(self, form_name: str, sheet_name: str = "forms") -> bool:
+        """
+        Check if a form with the given name already exists
+        
+        Args:
+            form_name: Name of the form to check
+            sheet_name: Name of the sheet tab (default: "forms")
+            
+        Returns:
+            bool: True if form exists, False otherwise
+        """
+        try:
+            forms = self.get_all_forms(sheet_name, include_user_submitted=True)
+            return any(form['form_name'].lower() == form_name.lower() for form in forms)
+        except Exception as e:
+            print(f"❌ Error checking if form exists: {str(e)}")
+            return False
+    
+    def add_custom_form(self, form_name: str, form_description: str, category: str = "One Concept in Mind", sheet_name: str = "forms") -> bool:
+        """
+        Add a custom user-submitted form to the Google Sheet
+        
+        Args:
+            form_name: Name of the custom form
+            form_description: Description of the custom form
+            category: Category of the form (default: "One Concept in Mind")
+            sheet_name: Name of the sheet tab (default: "forms")
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Check if form already exists
+            if self.form_exists(form_name, sheet_name):
+                print(f"⚠️ Form '{form_name}' already exists, skipping creation")
+                return True
+            
+            # Add the custom form with user_submitted=True
+            return self.add_form(
+                form_name=form_name,
+                form_description=form_description,
+                category=category,
+                user_submitted=True,
+                sheet_name=sheet_name
+            )
+            
+        except Exception as e:
+            print(f"❌ Error adding custom form: {str(e)}")
+            return False
+    
+    def update_form(self, row_number: int, form_name: str, form_description: str, category: str = "", sheet_name: str = "forms") -> bool:
         """
         Update a form in the Google Sheet
         
