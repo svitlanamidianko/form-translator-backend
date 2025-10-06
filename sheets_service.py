@@ -291,14 +291,14 @@ class SheetsService:
             print(f"❌ Error checking if form exists: {str(e)}")
             return False
     
-    def add_custom_form(self, form_name: str, form_description: str, category: str = "One Concept in Mind", sheet_name: str = "forms") -> bool:
+    def add_custom_form(self, form_name: str, form_description: str = "", category: str = "", sheet_name: str = "forms") -> bool:
         """
         Add a custom user-submitted form to the Google Sheet
         
         Args:
             form_name: Name of the custom form
-            form_description: Description of the custom form
-            category: Category of the form (default: "One Concept in Mind")
+            form_description: Description of the custom form (will be empty for custom forms)
+            category: Category of the form (will be empty for custom forms)
             sheet_name: Name of the sheet tab (default: "forms")
             
         Returns:
@@ -310,11 +310,11 @@ class SheetsService:
                 print(f"⚠️ Form '{form_name}' already exists, skipping creation")
                 return True
             
-            # Add the custom form with user_submitted=True
+            # Add the custom form with user_submitted=True and empty description/category
             return self.add_form(
                 form_name=form_name,
-                form_description=form_description,
-                category=category,
+                form_description="",  # Empty description for custom forms
+                category="",  # Empty category for custom forms
                 user_submitted=True,
                 sheet_name=sheet_name
             )
@@ -1067,6 +1067,106 @@ class SheetsService:
         except Exception as e:
             print(f"❌ Error getting interest counter for {content_type}: {str(e)}")
             return 0
+
+    def create_feedback_headers_if_needed(self, sheet_name: str = "feedback"):
+        """
+        Create headers in the feedback sheet if they don't exist
+        Headers: Id | Text | DateTime
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Check if headers exist
+            range_name = f"{sheet_name}!A1:C1"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            expected_headers = ['Id', 'Text', 'DateTime']
+            
+            # If no headers or wrong headers, create them
+            if not values or values[0] != expected_headers:
+                headers = [expected_headers]
+                
+                body = {
+                    'values': headers
+                }
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A1:C1",
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                print(f"✅ Feedback headers created in Google Sheet tab '{sheet_name}'")
+            else:
+                print(f"✅ Feedback headers already exist in tab '{sheet_name}'")
+                
+        except HttpError as e:
+            print(f"❌ HTTP Error creating feedback headers: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error creating feedback headers: {str(e)}")
+            raise
+
+    def add_feedback(self, text: str, sheet_name: str = "feedback") -> bool:
+        """
+        Add feedback to the Google Sheet
+        
+        Args:
+            text: The feedback text to add
+            sheet_name: Name of the feedback sheet tab (default: "feedback")
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Ensure feedback headers exist
+            self.create_feedback_headers_if_needed(sheet_name)
+            
+            # Generate unique ID for this feedback (timestamp-based)
+            from datetime import datetime
+            import uuid
+            
+            # Create a short unique ID
+            feedback_id = str(uuid.uuid4())[:8]
+            
+            # Format datetime as a readable string
+            current_datetime = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+            
+            # Prepare the data to append
+            # Columns: Id | Text | DateTime
+            values = [[feedback_id, text, current_datetime]]
+            
+            body = {
+                'values': values
+            }
+            
+            # Append the data to the feedback sheet
+            result = self.service.spreadsheets().values().append(
+                spreadsheetId=self.sheet_id,
+                range=f"{sheet_name}!A:C",
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            ).execute()
+            
+            print(f"✅ Feedback added to sheet: {feedback_id} - {text[:50]}...")
+            return True
+            
+        except HttpError as e:
+            print(f"❌ HTTP Error adding feedback: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Error adding feedback: {str(e)}")
+            return False
 
 
 # Global instance - will be initialized in the routes

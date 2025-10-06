@@ -3,6 +3,8 @@ from . import api
 import datetime
 import os
 import sys
+import threading
+import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sheets_service import get_sheets_service, initialize_sheets_service
 
@@ -40,7 +42,14 @@ def get_openai_client():
 # Google Sheet configuration
 SHEET_ID = "1sEnmusmz4X_18emilcsLFIn48nwM6qInLgQKN2rXC5M"
 
-# Initialize sheets service on module load
+# Global state for background initialization
+_sheets_initialization_status = {
+    'initialized': False,
+    'in_progress': False,
+    'error': None,
+    'start_time': None
+}
+
 def initialize_global_sheets_service():
     """Initialize the global sheets service with our sheet ID"""
     try:
@@ -51,12 +60,74 @@ def initialize_global_sheets_service():
         print(f"❌ Failed to initialize global sheets service: {str(e)}")
         return False
 
-# Initialize on module load
-initialize_global_sheets_service()
+def _background_initialize_sheets():
+    """Background thread function to initialize sheets service"""
+    global _sheets_initialization_status
+    
+    _sheets_initialization_status['in_progress'] = True
+    _sheets_initialization_status['start_time'] = time.time()
+    
+    try:
+        print("🔄 Starting background Google Sheets initialization...")
+        success = initialize_global_sheets_service()
+        
+        if success:
+            _sheets_initialization_status['initialized'] = True
+            elapsed = time.time() - _sheets_initialization_status['start_time']
+            print(f"✅ Background sheets initialization completed in {elapsed:.2f}s")
+        else:
+            _sheets_initialization_status['error'] = "Initialization failed"
+            print("❌ Background sheets initialization failed")
+            
+    except Exception as e:
+        _sheets_initialization_status['error'] = str(e)
+        print(f"❌ Background sheets initialization error: {str(e)}")
+    finally:
+        _sheets_initialization_status['in_progress'] = False
+
+def start_background_sheets_initialization():
+    """Start the background sheets initialization thread"""
+    if not _sheets_initialization_status['in_progress'] and not _sheets_initialization_status['initialized']:
+        thread = threading.Thread(target=_background_initialize_sheets, daemon=True)
+        thread.start()
+        print("🚀 Started background Google Sheets initialization thread")
+
+# Start background initialization immediately
+start_background_sheets_initialization()
 
 def get_current_timestamp():
     """Utility function to get current timestamp in ISO format"""
     return datetime.datetime.now().isoformat()
+
+def wait_for_sheets_initialization(max_wait_seconds=10):
+    """
+    Wait for sheets initialization to complete, with timeout
+    
+    Args:
+        max_wait_seconds: Maximum time to wait for initialization
+        
+    Returns:
+        bool: True if initialized successfully, False if timeout or error
+    """
+    global _sheets_initialization_status
+    
+    if _sheets_initialization_status['initialized']:
+        return True
+    
+    if _sheets_initialization_status['error']:
+        return False
+    
+    # Wait for initialization to complete
+    start_wait = time.time()
+    while time.time() - start_wait < max_wait_seconds:
+        if _sheets_initialization_status['initialized']:
+            return True
+        if _sheets_initialization_status['error']:
+            return False
+        time.sleep(0.1)  # Check every 100ms
+    
+    print(f"⚠️ Sheets initialization timeout after {max_wait_seconds}s")
+    return False
 
 
 def get_form_types(include_user_submitted: bool = False):
@@ -68,6 +139,11 @@ def get_form_types(include_user_submitted: bool = False):
         include_user_submitted: Whether to include user-submitted forms (default: False)
     """
     try:
+        # Wait for sheets service to be initialized
+        if not wait_for_sheets_initialization():
+            print("❌ Sheets service initialization failed or timed out, using fallback")
+            return {}
+            
         sheets_service = get_sheets_service()
         if not sheets_service:
             print("❌ Sheets service not available, using fallback")
@@ -114,6 +190,11 @@ def get_form_types_with_categories(include_user_submitted: bool = False):
         include_user_submitted: Whether to include user-submitted forms (default: False)
     """
     try:
+        # Wait for sheets service to be initialized
+        if not wait_for_sheets_initialization():
+            print("❌ Sheets service initialization failed or timed out, using fallback")
+            return {}
+            
         sheets_service = get_sheets_service()
         if not sheets_service:
             print("❌ Sheets service not available, using fallback")
@@ -169,6 +250,10 @@ def get_prompt_from_sheet(prompt_id: str = "1") -> str:
         ValueError: If prompt is not found in the sheet
     """
     try:
+        # Wait for sheets service to be initialized
+        if not wait_for_sheets_initialization():
+            raise ValueError("Sheets service initialization failed or timed out. Cannot retrieve prompt from database.")
+            
         sheets_service = get_sheets_service()
         if not sheets_service:
             raise ValueError("Sheets service not available. Cannot retrieve prompt from database.")
@@ -221,18 +306,17 @@ def translate_form():
         if source_form not in form_types:
             print(f"🔍 DEBUG: Source form '{source_form}' not found in existing forms")
             print(f"🔍 DEBUG: Source form description provided: '{source_form_description}'")
-            # Use provided description or default to form name
-            description = source_form_description or f"Custom form: {source_form}"
             
-            # This is a custom form, add it to the sheet
+            # This is a custom form, add it to the sheet with empty description and category
             success = sheets_service.add_custom_form(
                 form_name=source_form,
-                form_description=description
+                form_description="",  # Empty description for custom forms
+                category=""  # Empty category for custom forms
             )
             if success:
                 print(f"✅ Added custom source form: {source_form}")
-                # Update form_types to include the new form
-                form_types[source_form] = f"{source_form} - {description}"
+                # Update form_types to include the new form (just the name, no description)
+                form_types[source_form] = source_form
             else:
                 print(f"⚠️ Failed to add custom source form: {source_form}")
                 error_msg = f"Failed to create custom sourceForm '{source_form}'. Please try again."
@@ -242,18 +326,17 @@ def translate_form():
         if target_form not in form_types:
             print(f"🔍 DEBUG: Target form '{target_form}' not found in existing forms")
             print(f"🔍 DEBUG: Target form description provided: '{target_form_description}'")
-            # Use provided description or default to form name
-            description = target_form_description or f"Custom form: {target_form}"
             
-            # This is a custom form, add it to the sheet
+            # This is a custom form, add it to the sheet with empty description and category
             success = sheets_service.add_custom_form(
                 form_name=target_form,
-                form_description=description
+                form_description="",  # Empty description for custom forms
+                category=""  # Empty category for custom forms
             )
             if success:
                 print(f"✅ Added custom target form: {target_form}")
-                # Update form_types to include the new form
-                form_types[target_form] = f"{target_form} - {description}"
+                # Update form_types to include the new form (just the name, no description)
+                form_types[target_form] = target_form
             else:
                 print(f"⚠️ Failed to add custom target form: {target_form}")
                 error_msg = f"Failed to create custom targetForm '{target_form}'. Please try again."
@@ -367,6 +450,190 @@ def translate_form():
             "error": f"Translation failed: {str(e)}",
             "timestamp": get_current_timestamp()
         }), 500
+
+@api.route('/detect-form', methods=['POST'])
+def detect_form():
+    """
+    Detect the form of input text using AI analysis
+    
+    Expected request body:
+    {
+        "text": "Text to analyze for form detection"
+    }
+    
+    Returns:
+    JSON response with detected form information including:
+    - detectedForm: The detected form name
+    - confidence: Confidence level (high/medium/low)
+    - reasoning: Explanation of why this form was detected
+    - isCustomForm: Whether this is a custom form not in the database
+    - availableForms: List of forms that were considered
+    """
+    try:
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        text = data.get('text')
+        if not text:
+            return jsonify({"error": "text is required"}), 400
+        
+        # Validate that text is not empty after trimming
+        text = text.strip()
+        if not text:
+            return jsonify({"error": "text cannot be empty"}), 400
+        
+        # Get all available forms from the database (including user-submitted ones for detection)
+        form_types = get_form_types(include_user_submitted=True)
+        
+        if not form_types:
+            return jsonify({
+                "error": "No forms available in database for detection"
+            }), 500
+        
+        # Build the detection prompt
+        forms_list = []
+        for form_name, form_description in form_types.items():
+            forms_list.append(f"- {form_name}")
+        
+        forms_text = "\n".join(forms_list)
+        
+        detection_prompt = f"""You are a Form Detection expert who understands that language is a wrapper around meaning. Different forms (ontologies) like STEM, woo-woo, policy, UX, poetry, etc. can express the same underlying meaning using different conceptual frameworks, vocabularies, and ways of thinking.
+
+Your task is to identify which ontological framework/form the text is using to express its meaning.
+
+Available forms in our database:
+{forms_text}
+
+Analyze this text to detect its form:
+
+Text to analyze: "{text}"
+
+PHILOSOPHY OF FORM DETECTION:
+- Each form has its own concepts, idioms, vocabulary, and way of thinking
+- Forms are different "ontologies" - different ways of understanding and expressing reality
+- The same meaning can be wrapped in different forms for different audiences
+- Look for the underlying conceptual framework, not just style or tone
+
+DETECTION INSTRUCTIONS:
+1. Identify which ontological framework/conceptual system the text is using
+2. Look for form-specific vocabulary, concepts, metaphors, and ways of reasoning
+3. Consider the audience and purpose the text seems designed for
+4. Match to existing forms first, but suggest new forms if the text uses a distinct ontology
+5. Some text might blend multiple forms or have no clear ontological framework
+6. Keep your reasoning to exactly two sentences - be concise and clear
+7. Do NOT quote or reference the input text in your reasoning - explain the form directly. Start with "This form..." or "The [form name] ontology..." instead of "The text..."
+
+Respond in this exact JSON format:
+{{
+    "detectedForm": "form_name_here",
+    "reasoning": "Explain why this form was detected - focus on the ontological framework, not the input text (keep to exactly two sentences)",
+    "isCustomForm": true/false,
+    "alternativeForms": ["form1", "form2"] (if multiple ontological frameworks detected)
+}}
+
+If no clear ontological framework is detected, use "neutral" and explain why."""
+
+        # Make OpenAI API call for form detection
+        openai_client = get_openai_client()
+        
+        # Handle both legacy and new OpenAI client methods
+        if hasattr(openai_client, 'chat') and hasattr(openai_client.chat, 'completions'):
+            # New OpenAI client method
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a Form Detection expert who understands that different forms are ontological frameworks for expressing meaning. You identify which conceptual system a text uses. Always respond with valid JSON."},
+                    {"role": "user", "content": detection_prompt}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+        else:
+            # Legacy OpenAI method
+            response = openai_client.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a Form Detection expert who understands that different forms are ontological frameworks for expressing meaning. You identify which conceptual system a text uses. Always respond with valid JSON."},
+                    {"role": "user", "content": detection_prompt}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+        
+        detection_result = response.choices[0].message.content.strip()
+        
+        # Parse the JSON response
+        import json
+        try:
+            detection_data = json.loads(detection_result)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, create a fallback response
+            detection_data = {
+                "detectedForm": "neutral",
+                "reasoning": "Unable to parse AI response",
+                "isCustomForm": True,
+                "alternativeForms": []
+            }
+        
+        # Validate and clean the response
+        detected_form = detection_data.get('detectedForm', 'neutral')
+        reasoning = detection_data.get('reasoning', 'No reasoning provided')
+        is_custom_form = detection_data.get('isCustomForm', True)
+        alternative_forms = detection_data.get('alternativeForms', [])
+        
+        # Check if the detected form exists in our database
+        if detected_form in form_types:
+            is_custom_form = False
+        else:
+            is_custom_form = True
+        
+        # If it's a custom form, add it to the database
+        if is_custom_form and detected_form != "neutral":
+            try:
+                sheets_service = get_sheets_service()
+                if sheets_service:
+                    success = sheets_service.add_custom_form(
+                        form_name=detected_form,
+                        form_description=f"Auto-detected form: {reasoning}",
+                        category="auto-detected"
+                    )
+                    if success:
+                        print(f"✅ Added auto-detected custom form: {detected_form}")
+            except Exception as e:
+                print(f"⚠️ Failed to add auto-detected form to database: {str(e)}")
+        
+        return jsonify({
+            "detectedForm": detected_form,
+            "reasoning": reasoning,
+            "isCustomForm": is_custom_form,
+            "alternativeForms": alternative_forms
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Form detection failed: {str(e)}"
+        }), 500
+
+
+@api.route('/status', methods=['GET'])
+def get_initialization_status():
+    """Get the current initialization status of the sheets service"""
+    global _sheets_initialization_status
+    
+    status_info = {
+        "sheets_initialized": _sheets_initialization_status['initialized'],
+        "sheets_in_progress": _sheets_initialization_status['in_progress'],
+        "sheets_error": _sheets_initialization_status['error'],
+        "timestamp": get_current_timestamp()
+    }
+    
+    if _sheets_initialization_status['start_time']:
+        elapsed = time.time() - _sheets_initialization_status['start_time']
+        status_info["initialization_elapsed_seconds"] = round(elapsed, 2)
+    
+    return jsonify(status_info)
 
 @api.route('/forms', methods=['GET'])
 def get_available_forms():
@@ -645,6 +912,70 @@ def track_interest():
     except Exception as e:
         return jsonify({
             "error": f"Failed to track interest: {str(e)}",
+            "timestamp": get_current_timestamp()
+        }), 500
+
+
+# Feedback Routes
+
+@api.route('/feedback', methods=['POST'])
+def submit_feedback():
+    """
+    Submit feedback to the Google Sheets feedback sub-sheet
+    
+    Expected request body:
+    {
+        "text": "User feedback text here"
+    }
+    
+    Returns:
+        JSON response with success status and feedback details
+    """
+    try:
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        feedback_text = data.get('text')
+        
+        # Validate required parameters
+        if not feedback_text:
+            return jsonify({"error": "text is required"}), 400
+        
+        # Validate that text is not empty after trimming
+        feedback_text = feedback_text.strip()
+        if not feedback_text:
+            return jsonify({"error": "text cannot be empty"}), 400
+        
+        sheets_service = get_sheets_service()
+        if not sheets_service:
+            return jsonify({
+                "error": "Sheets service not available",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+        # Add feedback to the Google Sheet
+        success = sheets_service.add_feedback(feedback_text)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": "Feedback submitted successfully",
+                "feedback": {
+                    "text": feedback_text,
+                    "timestamp": get_current_timestamp()
+                }
+            })
+        else:
+            return jsonify({
+                "error": "Failed to submit feedback to database",
+                "timestamp": get_current_timestamp()
+            }), 500
+        
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to submit feedback: {str(e)}",
             "timestamp": get_current_timestamp()
         }), 500
 
