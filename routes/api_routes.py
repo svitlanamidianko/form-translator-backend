@@ -290,6 +290,10 @@ def translate_form():
         source_form_description = data.get('sourceFormDescription', '')
         target_form_description = data.get('targetFormDescription', '')
         
+        # DEBUG: Log the translation request parameters
+        print(f"🔍 DEBUG: Translation request - sourceForm: '{source_form}', targetForm: '{target_form}'")
+        print(f"🔍 DEBUG: Translation request - sourceText: '{source_text[:50]}...' (truncated)")
+        
         # Validate required parameters
         if not all([source_form, target_form, source_text]):
             return jsonify({
@@ -421,6 +425,10 @@ def translate_form():
         try:
             sheets_service = get_sheets_service()
             if sheets_service:
+                # DEBUG: Log what we're about to store in history
+                print(f"🔍 DEBUG: Logging to history - sourceForm: '{source_form}', targetForm: '{target_form}'")
+                print(f"🔍 DEBUG: Logging to history - sourceText: '{source_text[:30]}...', targetText: '{translated_text[:30]}...'")
+                
                 success = sheets_service.add_translation_to_history(
                     source_form=source_form,
                     source_text=source_text,
@@ -564,11 +572,16 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
         
         detection_result = response.choices[0].message.content.strip()
         
+        # DEBUG: Log the raw AI response
+        print(f"🔍 DEBUG: Raw AI detection response: {detection_result}")
+        
         # Parse the JSON response
         import json
         try:
             detection_data = json.loads(detection_result)
-        except json.JSONDecodeError:
+            print(f"🔍 DEBUG: Parsed detection data: {detection_data}")
+        except json.JSONDecodeError as e:
+            print(f"🔍 DEBUG: JSON parsing failed: {e}")
             # If JSON parsing fails, create a fallback response
             detection_data = {
                 "detectedForm": "neutral",
@@ -583,14 +596,21 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
         is_custom_form = detection_data.get('isCustomForm', True)
         alternative_forms = detection_data.get('alternativeForms', [])
         
+        # DEBUG: Log the detected form before processing
+        print(f"🔍 DEBUG: Detected form before processing: '{detected_form}'")
+        print(f"🔍 DEBUG: Available form types: {list(form_types.keys())}")
+        
         # Check if the detected form exists in our database
         if detected_form in form_types:
             is_custom_form = False
+            print(f"🔍 DEBUG: Form '{detected_form}' exists in database, not custom")
         else:
             is_custom_form = True
+            print(f"🔍 DEBUG: Form '{detected_form}' not in database, is custom")
         
         # If it's a custom form, add it to the database
         if is_custom_form and detected_form != "neutral":
+            print(f"🔍 DEBUG: Adding custom form '{detected_form}' to database")
             try:
                 sheets_service = get_sheets_service()
                 if sheets_service:
@@ -601,8 +621,19 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
                     )
                     if success:
                         print(f"✅ Added auto-detected custom form: {detected_form}")
+                    else:
+                        print(f"❌ Failed to add auto-detected custom form: {detected_form}")
+                else:
+                    print(f"❌ Sheets service not available")
             except Exception as e:
                 print(f"⚠️ Failed to add auto-detected form to database: {str(e)}")
+        elif detected_form == "neutral":
+            print(f"🔍 DEBUG: Skipping database addition for 'neutral' form")
+        else:
+            print(f"🔍 DEBUG: Skipping database addition for existing form '{detected_form}'")
+        
+        # DEBUG: Log the final response
+        print(f"🔍 DEBUG: Final response - detectedForm: '{detected_form}', isCustomForm: {is_custom_form}")
         
         return jsonify({
             "detectedForm": detected_form,
@@ -861,16 +892,16 @@ def update_star():
 @api.route('/interest', methods=['POST'])
 def track_interest():
     """
-    Track user interest by incrementing counters for content types
+    Track user interest by creating individual records for each click
     
     Expected request body:
     {
-        "contentType": "images" | "websites",
+        "what": "images" | "websites" | any content type,
         "timestamp": "2025-01-15T10:30:45.123Z"  // optional
     }
     
     Returns:
-        JSON response with success status and updated counter
+        JSON response with success status and record details
     """
     try:
         # Get request data
@@ -878,18 +909,17 @@ def track_interest():
         if not data:
             return jsonify({"error": "No data provided"}), 400
         
-        content_type = data.get('contentType')
+        what = data.get('what')
         timestamp = data.get('timestamp', get_current_timestamp())
         
         # Validate required parameters
-        if not content_type:
-            return jsonify({"error": "contentType is required"}), 400
+        if not what:
+            return jsonify({"error": "what is required"}), 400
         
-        # Validate content type
-        if content_type.lower() not in ['images', 'websites']:
-            return jsonify({
-                "error": f"Invalid contentType '{content_type}'. Must be 'images' or 'websites'"
-            }), 400
+        # Validate that what is not empty after trimming
+        what = what.strip()
+        if not what:
+            return jsonify({"error": "what cannot be empty"}), 400
         
         sheets_service = get_sheets_service()
         if not sheets_service:
@@ -898,20 +928,20 @@ def track_interest():
                 "timestamp": get_current_timestamp()
             }), 500
         
-        # Increment the interest counter
-        new_count = sheets_service.increment_interest_counter(content_type)
+        # Add the interest record (creates a new row for each click)
+        record_id = sheets_service.add_interest_record(what, timestamp)
         
         return jsonify({
             "success": True,
-            "message": "Interest tracked successfully",
-            "totalInterest": new_count,
-            "contentType": content_type,
+            "message": "Interest recorded successfully",
+            "recordId": record_id,
+            "what": what,
             "timestamp": timestamp
         })
         
     except Exception as e:
         return jsonify({
-            "error": f"Failed to track interest: {str(e)}",
+            "error": f"Failed to record interest: {str(e)}",
             "timestamp": get_current_timestamp()
         }), 500
 

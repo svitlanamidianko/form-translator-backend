@@ -305,19 +305,25 @@ class SheetsService:
             bool: True if successful, False otherwise
         """
         try:
+            # DEBUG: Log the form being added
+            print(f"🔍 DEBUG: Adding custom form - name: '{form_name}', description: '{form_description}', category: '{category}'")
+            
             # Check if form already exists
             if self.form_exists(form_name, sheet_name):
                 print(f"⚠️ Form '{form_name}' already exists, skipping creation")
                 return True
             
             # Add the custom form with user_submitted=True and empty description/category
-            return self.add_form(
+            result = self.add_form(
                 form_name=form_name,
                 form_description="",  # Empty description for custom forms
                 category="",  # Empty category for custom forms
                 user_submitted=True,
                 sheet_name=sheet_name
             )
+            
+            print(f"🔍 DEBUG: add_form result for '{form_name}': {result}")
+            return result
             
         except Exception as e:
             print(f"❌ Error adding custom form: {str(e)}")
@@ -623,6 +629,9 @@ class SheetsService:
             bool: True if successful, False otherwise
         """
         try:
+            # DEBUG: Log what we're storing in history
+            print(f"🔍 DEBUG: Sheets service - storing in history: sourceForm='{source_form}', targetForm='{target_form}'")
+            
             if not self.sheet_id:
                 raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
             
@@ -652,6 +661,10 @@ class SheetsService:
                 target_text,
                 current_datetime
             ]]
+            
+            # DEBUG: Log the exact values being written to the sheet
+            print(f"🔍 DEBUG: Writing to history sheet - values: {values[0]}")
+            print(f"🔍 DEBUG: Specifically - source_form: '{source_form}', target_form: '{target_form}'")
             
             body = {
                 'values': values
@@ -1167,6 +1180,118 @@ class SheetsService:
         except Exception as e:
             print(f"❌ Error adding feedback: {str(e)}")
             return False
+
+    def create_interest_registered_headers_if_needed(self, sheet_name: str = "interest_registered"):
+        """
+        Create headers in the interest registered sheet if they don't exist
+        Headers: id | what | datetime
+        """
+        try:
+            if not self.sheet_id:
+                raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+            
+            # Check if headers exist
+            range_name = f"{sheet_name}!A1:C1"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            expected_headers = ['id', 'what', 'datetime']
+            
+            # If no headers or wrong headers, create them
+            if not values or values[0] != expected_headers:
+                headers = [expected_headers]
+                
+                body = {
+                    'values': headers
+                }
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A1:C1",
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                print(f"✅ Interest registered headers created in Google Sheet tab '{sheet_name}'")
+            else:
+                print(f"✅ Interest registered headers already exist in tab '{sheet_name}'")
+                
+        except HttpError as e:
+            print(f"❌ HTTP Error creating interest registered headers: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error creating interest registered headers: {str(e)}")
+            raise
+
+    def add_interest_record(self, what: str, datetime_str: str, sheet_name: str = "interest_registered") -> str:
+        """
+        Add a new interest record to the sheet (creates a new row for each click)
+        
+        Args:
+            what: The content type or action being tracked
+            datetime_str: The timestamp for this record
+            sheet_name: The sheet name to add to (default: "interest_registered")
+            
+        Returns:
+            str: The generated record ID
+        """
+        try:
+            if not self.service or not self.sheet_id:
+                raise ValueError("Sheets service not initialized")
+            
+            # Ensure headers exist
+            self.create_interest_registered_headers_if_needed(sheet_name)
+            
+            # Get current data to determine next ID
+            range_name = f"{sheet_name}!A:C"
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Calculate next ID (start from 1 if no data, otherwise increment from max ID)
+            next_id = 1
+            if len(values) > 1:  # Skip header row
+                max_id = 0
+                for row in values[1:]:
+                    if len(row) >= 1:
+                        try:
+                            current_id = int(row[0])
+                            max_id = max(max_id, current_id)
+                        except ValueError:
+                            continue
+                next_id = max_id + 1
+            
+            # Prepare the new record
+            record_data = [[next_id, what, datetime_str]]
+            
+            body = {
+                'values': record_data
+            }
+            
+            # Append the new record to the sheet
+            result = self.service.spreadsheets().values().append(
+                spreadsheetId=self.sheet_id,
+                range=f"{sheet_name}!A:C",
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            ).execute()
+            
+            print(f"✅ Interest record added: ID {next_id} - {what} at {datetime_str}")
+            return str(next_id)
+            
+        except HttpError as e:
+            print(f"❌ HTTP Error adding interest record: {e}")
+            raise
+        except Exception as e:
+            print(f"❌ Error adding interest record: {str(e)}")
+            raise
 
 
 # Global instance - will be initialized in the routes
