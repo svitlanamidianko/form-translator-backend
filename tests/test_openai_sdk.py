@@ -114,3 +114,54 @@ def test_image_edit_multipart_request():
     assert b'filename="photo.jpg"' in body
     assert b"Content-Type: image/jpeg" in body
     assert fake_jpeg in body
+
+
+def test_image_via_chat_openrouter_style(monkeypatch):
+    """OPENAI_IMAGE_API=chat: the photo goes out as a chat message, the new image comes back in message.images"""
+    import io
+    from PIL import Image
+
+    monkeypatch.setenv("OPENAI_IMAGE_API", "chat")
+    monkeypatch.setenv("OPENAI_IMAGE_MODEL", "google/gemini-3.1-flash-image")
+    png = io.BytesIO()
+    Image.new("RGB", (30, 20), (200, 100, 50)).save(png, format="PNG")
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        answer = chat_response("here you go")
+        answer["choices"][0]["message"]["images"] = [{
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()},
+        }]
+        return httpx.Response(200, json=answer)
+
+    openai_service.set_openai_client(make_client(handler))
+    result = openai_service.edit_image(b"\xff\xd8\xff\xe0fake-jpeg-bytes", "make it poetic", "1536x1024")
+
+    with Image.open(io.BytesIO(base64.b64decode(result))) as img:
+        assert img.format == "JPEG" and img.size == (30, 20)
+    path, body = seen[0]
+    assert path == "/v1/chat/completions"
+    assert body["model"] == "google/gemini-3.1-flash-image"
+    assert body["modalities"] == ["image", "text"]
+    content = body["messages"][0]["content"]
+    assert content[0]["text"].startswith("make it poetic")
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_image_via_chat_without_image_is_an_error(monkeypatch):
+    monkeypatch.setenv("OPENAI_IMAGE_API", "chat")
+    openai_service.set_openai_client(make_client(lambda request: httpx.Response(200, json=chat_response("sorry, no"))))
+    with pytest.raises(openai_service.OpenAIEmptyResponseError):
+        openai_service.edit_image(b"\xff\xd8\xff\xe0x", "make it poetic", "1024x1024")
+
+
+def test_base_url_from_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-or-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    openai_service.set_openai_client(None)
+    try:
+        assert str(openai_service.get_openai_client().base_url).rstrip("/") == "https://openrouter.ai/api/v1"
+    finally:
+        openai_service.set_openai_client(None)

@@ -13,8 +13,15 @@ Which models we use is configured with environment variables (see env.example):
 - OPENAI_REASONING_EFFORT   none|low|medium|...   (default: low; empty = don't send it)
 - OPENAI_IMAGE_MODEL        image model           (default: gpt-image-2.5-flare)
 - OPENAI_IMAGE_QUALITY      low|medium|high|auto  (default: low)
+- OPENAI_BASE_URL           another OpenAI-compatible API, e.g. https://openrouter.ai/api/v1
+                            (default: OpenAI itself)
+- OPENAI_IMAGE_API          edits|chat            (default: edits)
+                            "chat" makes photos with a chat model that can answer with images,
+                            which is how OpenRouter does it (e.g. OPENAI_IMAGE_MODEL=google/gemini-3.1-flash-image)
 """
 
+import base64
+import io
 import json
 import os
 import re
@@ -80,6 +87,15 @@ def get_image_quality() -> str:
     return (os.environ.get("OPENAI_IMAGE_QUALITY") or "").strip() or DEFAULT_IMAGE_QUALITY
 
 
+def get_base_url():
+    """None means the normal OpenAI API"""
+    return (os.environ.get("OPENAI_BASE_URL") or "").strip() or None
+
+
+def get_image_api() -> str:
+    return "chat" if (os.environ.get("OPENAI_IMAGE_API") or "").strip().lower() == "chat" else "edits"
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -96,8 +112,9 @@ def get_openai_client():
                     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
                 # Text calls rarely take more than a few seconds; image edits get their own longer timeout below
-                _client = OpenAI(api_key=api_key, timeout=CHAT_TIMEOUT_SECONDS, max_retries=2)
-                print(f"✅ OpenAI client initialized (text model: {get_text_model()}, image model: {get_image_model()})")
+                _client = OpenAI(api_key=api_key, base_url=get_base_url(), timeout=CHAT_TIMEOUT_SECONDS, max_retries=2)
+                print(f"✅ OpenAI client initialized (api: {get_base_url() or 'OpenAI'}, text model: {get_text_model()}, "
+                      f"image model: {get_image_model()} via {get_image_api()})")
 
     return _client
 
@@ -225,6 +242,9 @@ def edit_image(image_bytes: bytes, prompt: str, size: str, quality: str = None, 
     Returns:
         str: the new image as base64-encoded JPEG
     """
+    if get_image_api() == "chat":
+        return _edit_image_with_chat(image_bytes, prompt, model=model, mime_type=mime_type)
+
     client = get_openai_client()
     result = client.images.edit(
         model=model or get_image_model(),
@@ -242,6 +262,44 @@ def edit_image(image_bytes: bytes, prompt: str, size: str, quality: str = None, 
     if not image_b64:
         raise OpenAIEmptyResponseError("OpenAI returned no image data")
     return image_b64
+
+
+def _edit_image_with_chat(image_bytes: bytes, prompt: str, model: str = None, mime_type: str = "image/jpeg") -> str:
+    """
+    Same as edit_image(), but through a chat model that answers with an image
+    (OpenRouter style: the picture comes back in message.images as a data URL).
+    """
+    client = get_openai_client()
+    photo_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    response = client.chat.completions.create(
+        model=model or get_image_model(),
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt + "\nKeep the photo's framing and aspect ratio. Answer with the edited image."},
+                {"type": "image_url", "image_url": {"url": photo_url}},
+            ],
+        }],
+        extra_body={"modalities": ["image", "text"]},
+        timeout=IMAGE_TIMEOUT_SECONDS,
+    )
+
+    message = response.choices[0].message
+    for image in getattr(message, "images", None) or []:
+        url = (image.get("image_url") or {}).get("url", "") if isinstance(image, dict) else ""
+        if url.startswith("data:") and "," in url:
+            return _to_jpeg_base64(base64.b64decode(url.split(",", 1)[1]))
+    raise OpenAIEmptyResponseError(f"The image model returned no image (model: {model or get_image_model()})")
+
+
+def _to_jpeg_base64(image_bytes: bytes) -> str:
+    """Chat image models often answer with PNG; the frontend expects JPEG"""
+    from PIL import Image  # only needed here
+
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        out = io.BytesIO()
+        img.convert("RGB").save(out, format="JPEG", quality=85)
+    return base64.b64encode(out.getvalue()).decode("ascii")
 
 
 # ---------------------------------------------------------------------------
