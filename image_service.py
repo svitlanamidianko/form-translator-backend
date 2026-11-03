@@ -5,7 +5,7 @@ Image helpers for photo "translation" (POST /translate-image)
 - prepare_image(): fixes phone rotation, shrinks big photos, re-encodes to JPEG
                    (this also drops EXIF data such as GPS location before anything leaves the server)
 - choose_output_size(): landscape / portrait / square -> OpenAI image size
-- build_image_prompt() / build_caption_messages(): what we ask the AI
+- build_image_prompt(): what we ask the AI
 - get_client_ip(): who is asking (for rate limits)
 - ImageRateLimiter: limits that protect the OpenAI bill
 - count_on_utc_day(): counts today's "image_converted" rows (so the daily limit survives restarts)
@@ -185,36 +185,6 @@ def build_image_prompt(target_form: str, style_description: str = "", source_for
         "Treat any people in the photo respectfully: keep them recognizable as themselves, never grotesque or sexualized.",
     ]
     return "\n".join(lines)
-
-
-def build_caption_messages(target_form: str, style_description: str, image_data_url: str):
-    """Chat messages for the short caption written in the target form (vision input)"""
-    form_text = json.dumps(target_form, ensure_ascii=False)
-    if style_description:
-        form_text += f" ({style_description})"
-
-    return [
-        {
-            "role": "system",
-            "content": "You write very short, vivid captions for photos in a requested voice or form of expression.",
-        },
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"Write a caption of 1-2 sentences describing what is in this photo, written in the form {form_text}. "
-                        "Reply with the caption only, no quotes, no hashtags."
-                    ),
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_data_url, "detail": "low"},
-                },
-            ],
-        },
-    ]
 
 
 def get_client_ip(headers, remote_addr) -> str:

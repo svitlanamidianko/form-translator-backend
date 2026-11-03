@@ -38,7 +38,7 @@ All of these have sensible defaults - only `OPENAI_API_KEY` is required.
 | Variable | Default | What it does |
 |---|---|---|
 | `OPENAI_API_KEY` | - | your OpenAI key |
-| `OPENAI_MODEL` | `gpt-5.6-luna` | text model (translate, detect form, auto-grouping, photo captions). `gpt-5.6-terra` is stronger but ~10x the price |
+| `OPENAI_MODEL` | `gpt-5.6-luna` | text model (translate, detect form, auto-grouping). `gpt-5.6-terra` is stronger but ~10x the price |
 | `OPENAI_REASONING_EFFORT` | `low` | `none` / `low` / `medium` / `high` / `xhigh` / `max`. Set it to `off` (or empty) for models without reasoning |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2.5-flare` | model for photo "translation" |
 | `OPENAI_IMAGE_QUALITY` | `low` | `low` / `medium` / `high` / `xhigh` / `max` / `auto` (higher = slower + pricier) |
@@ -85,7 +85,7 @@ It uses your `.env` (`OPENAI_API_KEY`) and the Google credentials file, like the
 
 ## Photo translation: `POST /translate-image`
 `multipart/form-data` with `image` (JPEG / PNG / WEBP, max 10 MB), `targetForm` (required) and `sourceForm` (optional).
-Returns `{"imageBase64", "mimeType": "image/jpeg", "caption", "targetForm", "timestamp"}`.
+Returns `{"imageBase64", "mimeType": "image/jpeg", "targetForm", "timestamp"}`.
 Errors: `400` bad input, `413` too large, `429` rate limited (with `retryAfterSeconds`), `500` with the real reason.
 Photos are never stored. Each successful conversion is counted in the `interest_registered` tab as `image_converted`.
 To protect the server's memory (1 GB), photos above 50 megapixels (JPEG), 32 MP (PNG) or 16 MP (WEBP) are refused with a `400`. `targetForm` / `sourceForm` can be at most 200 characters.

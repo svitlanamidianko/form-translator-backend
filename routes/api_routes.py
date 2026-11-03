@@ -5,7 +5,6 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from werkzeug.exceptions import RequestEntityTooLarge
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sheets_service import get_sheets_service, initialize_sheets_service, normalize_form_name, clean_form_name
@@ -258,7 +257,9 @@ def get_prompt_from_sheet(prompt_id: str = "1") -> str:
 # Answer budgets for the reasoning model (they include hidden reasoning tokens, so keep some headroom)
 TRANSLATION_MAX_COMPLETION_TOKENS = 3000
 DETECTION_MAX_COMPLETION_TOKENS = 2000
-CAPTION_MAX_COMPLETION_TOKENS = 1000
+
+# How many target forms /detect-form suggests for the right-hand side
+MAX_SUGGESTED_FORMS = 3
 
 
 def clean_quotes(text):
@@ -418,7 +419,9 @@ def detect_form():
     - confidence: Confidence level (high/medium/low)
     - reasoning: Explanation of why this form was detected
     - isCustomForm: Whether this is a custom form not in the database
-    - availableForms: List of forms that were considered
+    - alternativeForms: Other forms the text might be using
+    - suggestedForms: Up to 3 forms from the sheet that would pair well as translation targets
+      (e.g. a religious text -> other religions), never the detected form
     """
     try:
         # Get request data
@@ -478,13 +481,15 @@ DETECTION INSTRUCTIONS:
 5. Some text might blend multiple forms or have no clear ontological framework
 6. Keep your reasoning to exactly two sentences - be concise and clear
 7. Do NOT quote or reference the input text in your reasoning - explain the form directly. Start with "This form..." or "The [form name] ontology..." instead of "The text..."
+8. Suggest the {MAX_SUGGESTED_FORMS} forms from the list above that would pair best with this text as translation targets: forms that speak about the same things in a different ontology, so the translation is meaningful and surprising. For example, a religious or spiritual text pairs with other religions and spiritual traditions; a scientific text pairs with other sciences, philosophies or ways of knowing. Use exact names from the list and never the detected form.
 
 Respond in this exact JSON format:
 {{
     "detectedForm": "form_name_here",
     "reasoning": "Explain why this form was detected - focus on the ontological framework, not the input text (keep to exactly two sentences)",
     "isCustomForm": true/false,
-    "alternativeForms": ["form1", "form2"] (if multiple ontological frameworks detected)
+    "alternativeForms": ["form1", "form2"] (if multiple ontological frameworks detected),
+    "suggestedForms": ["form1", "form2", "form3"] (exactly as named in the list)
 }}
 
 If no clear ontological framework is detected, use "neutral" and explain why."""
@@ -512,7 +517,8 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
                 "detectedForm": "neutral",
                 "reasoning": "Unable to parse AI response",
                 "isCustomForm": True,
-                "alternativeForms": []
+                "alternativeForms": [],
+                "suggestedForms": []
             }
         
         # Validate and clean the response
@@ -537,6 +543,18 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
             is_custom_form = True
             print(f"🔍 DEBUG: Form '{detected_form}' not in database, is custom")
         
+        # Suggested targets: only forms the website lists (exact sheet spelling), never the detected form, no repeats
+        suggested_forms = []
+        raw_suggestions = detection_data.get('suggestedForms')
+        for name in raw_suggestions if isinstance(raw_suggestions, list) else []:
+            key = normalize_form_name(name) if isinstance(name, str) else ''
+            sheet_name = visible_by_key.get(key)
+            if not sheet_name or key == normalize_form_name(detected_form) or sheet_name in suggested_forms:
+                continue
+            suggested_forms.append(sheet_name)
+            if len(suggested_forms) == MAX_SUGGESTED_FORMS:
+                break
+        
         # If it's a new custom form, add it to the database (in the background; never "neutral", never twice)
         if forms_catalog.is_reserved_form_name(detected_form):
             print(f"🔍 DEBUG: Skipping database addition for '{detected_form}' form")
@@ -553,7 +571,8 @@ If no clear ontological framework is detected, use "neutral" and explain why."""
             "detectedForm": detected_form,
             "reasoning": reasoning,
             "isCustomForm": is_custom_form,
-            "alternativeForms": alternative_forms
+            "alternativeForms": alternative_forms,
+            "suggestedForms": suggested_forms
         })
         
     except Exception as e:
@@ -651,19 +670,6 @@ def _record_image_interest():
         print(f"⚠️ Could not record image_converted interest: {str(e)}")
 
 
-def _make_caption(target_form: str, style_description: str, image_data_url: str) -> str:
-    """Short caption of the photo written in the target form (best-effort: "" on any error)"""
-    try:
-        caption = chat_completion(
-            image_service.build_caption_messages(target_form, style_description, image_data_url),
-            max_completion_tokens=CAPTION_MAX_COMPLETION_TOKENS
-        )
-        return clean_quotes(caption)
-    except Exception as e:
-        print(f"⚠️ Caption failed (photo still returned): {describe_openai_error(e)}")
-        return ""
-
-
 def _is_moderation_block(error: Exception) -> bool:
     """True when OpenAI refused the image because of its safety system"""
     text = describe_openai_error(error).lower()
@@ -686,7 +692,6 @@ def translate_image():
     Returns:
     {
         "imageBase64": "<base64 jpeg>", "mimeType": "image/jpeg",
-        "caption": "<1-2 sentences in the target form, or empty>",
         "targetForm": "<name>", "timestamp": "<iso>"
     }
     Errors: 400 bad input, 413 too large, 429 rate limited (+ retryAfterSeconds), 500 with the real reason.
@@ -753,34 +758,20 @@ def translate_image():
         prompt = image_service.build_image_prompt(target_form, style_description, source_form)
         print(f"🖼️ Translating photo ({prepared.width}x{prepared.height} -> {size}) into '{target_form}' for {client_id}")
         
-        # The caption runs at the same time as the (slower) image edit
-        executor = ThreadPoolExecutor(max_workers=1)
         try:
-            caption_future = executor.submit(_make_caption, target_form, style_description, prepared.data_url)
-            
-            try:
-                image_base64 = edit_image(prepared.jpeg_bytes, prompt, size)
-            except Exception as e:
-                # If OpenAI failed on its side (down, overloaded, our settings), the try doesn't count.
-                # A refused photo (e.g. safety block) DOES count: OpenAI still did work for it
-                # (and the caption call is already running), so retrying can't bypass the limits.
-                if is_service_side_error(e):
-                    image_service.image_rate_limiter.release(client_id)
-                slot_taken = False
-                reason = describe_openai_error(e)
-                print(f"❌ Image translation failed: {reason}")
-                if _is_moderation_block(e):
-                    return jsonify({"error": f"This photo couldn't be translated because of the AI's safety rules: {reason}"}), 400
-                return jsonify({"error": f"Image translation failed: {reason}"}), 500
-            
-            try:
-                caption = caption_future.result(timeout=60)
-            except Exception as e:
-                print(f"⚠️ Caption not ready: {str(e)}")
-                caption = ""
-        finally:
-            # Don't wait for a caption we no longer need
-            executor.shutdown(wait=False)
+            image_base64 = edit_image(prepared.jpeg_bytes, prompt, size)
+        except Exception as e:
+            # If OpenAI failed on its side (down, overloaded, our settings), the try doesn't count.
+            # A refused photo (e.g. safety block) DOES count: OpenAI still did work for it,
+            # so retrying can't bypass the limits.
+            if is_service_side_error(e):
+                image_service.image_rate_limiter.release(client_id)
+            slot_taken = False
+            reason = describe_openai_error(e)
+            print(f"❌ Image translation failed: {reason}")
+            if _is_moderation_block(e):
+                return jsonify({"error": f"This photo couldn't be translated because of the AI's safety rules: {reason}"}), 400
+            return jsonify({"error": f"Image translation failed: {reason}"}), 500
         
         # Count it in the interest tab without making the visitor wait
         run_in_background(_record_image_interest)
@@ -788,7 +779,6 @@ def translate_image():
         return jsonify({
             "imageBase64": image_base64,
             "mimeType": "image/jpeg",
-            "caption": caption,
             "targetForm": target_form,
             "timestamp": get_current_timestamp()
         })

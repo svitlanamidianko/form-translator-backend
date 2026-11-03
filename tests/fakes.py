@@ -230,12 +230,6 @@ def default_chat_handler(params):
     system = _message_text(messages[0]["content"]) if messages and messages[0]["role"] == "system" else ""
     last = messages[-1]["content"]
 
-    # Photo caption (vision input = list content with an image_url part)
-    if isinstance(last, list):
-        form = re.search(r"written in the form (\"[^\"]*\")", _message_text(last))
-        form_name = json.loads(form.group(1)) if form else "this form"
-        return _completion(f"A photo, lovingly retold in the voice of {form_name} 🌿")
-
     user = _message_text(last)
 
     # Form detection
@@ -247,6 +241,7 @@ def default_chat_handler(params):
             "reasoning": f"This form leans on the idioms of {detected}. It wraps meaning in that ontology's vocabulary.",
             "isCustomForm": False,
             "alternativeForms": ["silly"],
+            "suggestedForms": ["silly", "nature", "science"],
         }
         return _completion("```json\n" + json.dumps(answer, ensure_ascii=False) + "\n```")
 

@@ -45,7 +45,7 @@ def post_image(client, data=None, filename="photo.jpg", target="poetic", source=
     return client.post("/translate-image", data=form, content_type="multipart/form-data", headers=headers or {})
 
 
-def test_happy_path_returns_base64_jpeg_and_caption(client, fake_openai, sheet_api, sync_background):
+def test_happy_path_returns_base64_jpeg(client, fake_openai, sheet_api, sync_background):
     response = post_image(client, make_image(), target="poetic", source="science")
     assert response.status_code == 200, response.get_data(as_text=True)
     data = response.get_json()
@@ -53,7 +53,7 @@ def test_happy_path_returns_base64_jpeg_and_caption(client, fake_openai, sheet_a
     assert data["mimeType"] == "image/jpeg"
     assert data["targetForm"] == "poetic"
     assert "timestamp" in data
-    assert data["caption"] == 'A photo, lovingly retold in the voice of poetic 🌿'
+    assert "caption" not in data
     returned = base64.b64decode(data["imageBase64"])
     assert returned[:3] == b"\xff\xd8\xff"
     Image.open(io.BytesIO(returned)).verify()
@@ -70,11 +70,8 @@ def test_happy_path_returns_base64_jpeg_and_caption(client, fake_openai, sheet_a
     assert "Image-rich, metaphor-forward lines" in params["prompt"]  # her column D description
     assert '"science"' in params["prompt"]
 
-    # The caption call: text model + the photo as vision input
-    caption_call = fake_openai.chat_calls[-1]
-    assert caption_call["model"] == "gpt-5.6-luna"
-    parts = caption_call["messages"][-1]["content"]
-    assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    # Only the image edit costs money: no extra text call for a caption
+    assert fake_openai.chat_calls == []
 
     # Interest recorded as "image_converted"
     assert sheet_api.tabs["interest_registered"][-1][1] == "image_converted"
@@ -215,15 +212,6 @@ def test_moderation_block_is_a_400_with_reason(client, fake_openai):
     response = post_image(client, make_image())
     assert response.status_code == 400
     assert "safety system" in response.get_json()["error"]
-
-
-def test_caption_failure_still_returns_image(client, fake_openai):
-    fake_openai.chat_errors.append(make_openai_error(429, "Rate limit reached for gpt-5.6-luna"))
-    response = post_image(client, make_image())
-    assert response.status_code == 200
-    data = response.get_json()
-    assert data["caption"] == ""
-    assert data["imageBase64"]
 
 
 def test_interest_tracking_failure_does_not_fail_request(client, sheet_api, sync_background):

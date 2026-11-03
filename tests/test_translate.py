@@ -292,13 +292,35 @@ def test_detect_form_parses_code_fenced_json(client, fake_openai, sheet_api, syn
     data = response.get_json()
     # Matched to the existing form, with the sheet's exact spelling
     assert data == {"detectedForm": "gen z", "reasoning": "This form uses slang. It is online.",
-                    "isCustomForm": False, "alternativeForms": ["teen"]}
+                    "isCustomForm": False, "alternativeForms": ["teen"], "suggestedForms": []}
 
     # Hidden + reserved forms aren't offered to the detector, visitor forms are
     prompt = fake_openai.chat_calls[-1]["messages"][-1]["content"]
     assert "- ELI5" in prompt and "- calm" in prompt
     assert "- spam test" not in prompt and "- neutral" not in prompt
     assert sheet_api.writes("append") == []
+
+
+def test_detect_form_suggests_pairing_targets(client, fake_openai):
+    fake_openai.chat_handler = lambda params: completion(
+        '{"detectedForm": "christian", "reasoning": "This form uses grace. It is pastoral.", "isCustomForm": false,'
+        ' "alternativeForms": [], "suggestedForms": ["Buddhist ", "christian", "made-up form", "spam test",'
+        ' "buddhist", "islam", "jewish mysticism", "hindu"]}')
+    response = client.post("/detect-form", json={"text": "By grace you have been saved"})
+    assert response.status_code == 200, response.get_data(as_text=True)
+    # Sheet spelling, no detected form, no unknown/hidden forms, no repeats, at most 3
+    assert response.get_json()["suggestedForms"] == ["buddhist", "islam", "jewish mysticism"]
+
+    prompt = fake_openai.chat_calls[-1]["messages"][-1]["content"]
+    assert "pair best with this text" in prompt
+
+
+def test_detect_form_bad_suggestions_are_ignored(client, fake_openai):
+    fake_openai.chat_handler = lambda params: completion(
+        '{"detectedForm": "poetic", "reasoning": "x", "isCustomForm": false, "suggestedForms": "nature"}')
+    response = client.post("/detect-form", json={"text": "roses are red"})
+    assert response.status_code == 200
+    assert response.get_json()["suggestedForms"] == []
 
 
 def test_detect_form_neutral_is_never_saved(client, fake_openai, sheet_api, sync_background):

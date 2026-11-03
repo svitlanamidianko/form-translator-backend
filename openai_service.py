@@ -3,7 +3,7 @@ OpenAI helpers for Form Translator Backend
 
 Everything that talks to OpenAI lives here, so the routes stay readable:
 - get_openai_client(): one shared client (official openai 2.x SDK)
-- chat_completion(): the ONE helper all text calls go through (translate, detect, grouping, captions)
+- chat_completion(): the ONE helper all text calls go through (translate, detect, grouping)
 - edit_image(): photo -> photo "translation" via the images edit endpoint
 - describe_openai_error(): turns an OpenAI exception into a human readable reason
 - parse_json_object(): robust JSON parsing for model answers (handles ```json fences)
