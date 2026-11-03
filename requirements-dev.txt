@@ -1,0 +1,5 @@
+# Extra packages for running the tests locally (not needed on the server)
+#   pip install -r requirements-dev.txt
+#   python -m pytest
+-r requirements.txt
+pytest==8.4.2
