@@ -2,20 +2,138 @@
 Google Sheets Service for Form Translator Backend
 
 This module handles all Google Sheets operations for storing forms data.
-The sheet structure is:
+The "forms" tab structure (what is ACTUALLY in the cells - the header row says
+something slightly different, and we never rewrite the header row):
 - Column A: id (number)
 - Column B: form name
-- Column C: form description  
-- Column D: category
-- Column E: user_submitted (boolean)
+- Column C: Ukrainian translation of the form name   (header says "form description")
+- Column D: English description of the form's style  (header says "category")
+- Column E: semantic group, e.g. "religion"          (header says "user_submitted")
+            type "hidden" here to hide a form from the website's list.
+            Older visitor-added rows have TRUE here instead of a group.
+- Column F: user_submitted (TRUE for forms added by visitors)
 """
 
 import os
 import json
+import re
+import threading
+import time
 from typing import List, Dict, Optional
+import google_auth_httplib2
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import HttpRequest, build_http
+
+# Cell values that mean "yes" / "no" in the user_submitted columns
+TRUE_LIKE_VALUES = {"true", "1", "yes"}
+FALSE_LIKE_VALUES = {"false", "0", "no"}
+
+# Used when a brand new (empty) forms tab gets its first header row
+DEFAULT_FORMS_HEADERS = ['id', 'form name', 'ukrainian name', 'description', 'group', 'user_submitted']
+
+# Only one thread at a time may "pick the next id + append a row" (otherwise two rows could get the same id)
+_form_write_lock = threading.Lock()
+
+
+def normalize_form_name(name) -> str:
+    """
+    Normalize a form name for duplicate checks:
+    "  Gen   Z " -> "gen z", "socialism " -> "socialism"
+    (trim + collapse inner spaces + casefold, which is like lower() but smarter for non-English letters)
+    """
+    if name is None:
+        return ""
+    return re.sub(r"\s+", " ", str(name)).strip().casefold()
+
+
+def clean_form_name(name) -> str:
+    """Trim a form name and collapse inner whitespace, keeping the original letter case"""
+    if name is None:
+        return ""
+    return re.sub(r"\s+", " ", str(name)).strip()
+
+
+def is_true_like(value) -> bool:
+    """True for TRUE / true / 1 / yes (and real booleans)"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in TRUE_LIKE_VALUES
+
+
+def is_bool_like(value) -> bool:
+    """True when a cell looks like a yes/no flag rather than real text (TRUE, FALSE, 1, 0, yes, no)"""
+    if isinstance(value, bool):
+        return True
+    if value is None:
+        return False
+    return str(value).strip().lower() in (TRUE_LIKE_VALUES | FALSE_LIKE_VALUES)
+
+
+def parse_form_row(row: list, sheet_row: int) -> Dict:
+    """
+    Convert one raw row from the forms tab (A:F) into a dictionary.
+
+    Args:
+        row: list of cell values as returned by the Sheets API (may be shorter than 6)
+        sheet_row: the row number in the sheet (1-based, the header is row 1)
+    """
+    def cell(index):
+        """Raw cell value ("" when the row is shorter than that column)"""
+        value = row[index] if len(row) > index else ""
+        return "" if value is None else value
+
+    def text(index):
+        return str(cell(index)).strip()
+
+    column_e = cell(4)
+    column_f = cell(5)
+
+    # Column E is normally the group, but older visitor rows have TRUE there
+    if is_bool_like(column_e):
+        group = ""
+    else:
+        group = clean_form_name(column_e)
+
+    return {
+        'form_id': text(0),
+        'form_name': str(cell(1)),           # raw name (may have stray spaces - use clean_form_name)
+        'ukrainian_name': text(2),           # column C
+        'description': text(3),              # column D - English description of the style
+        'group': group,                      # column E (or "" when E is TRUE/FALSE/empty)
+        'user_submitted': is_true_like(column_e) or is_true_like(column_f),
+        'row_number': sheet_row,
+    }
+
+
+def build_sheets_api(credentials, **build_options):
+    """
+    Build the Google Sheets API client so several threads can use it at the same time.
+
+    The normal build('sheets', 'v4', credentials=...) shares ONE connection object (httplib2.Http)
+    between all threads, and that object is not thread-safe: when a request and a background job
+    (e.g. saving a visitor's new form) talk to Google at the same moment, they can get each other's
+    answers or time out. Here every thread gets its own connection - like giving each worker their
+    own phone line instead of one shared phone. (Recipe from the google-api-python-client
+    "thread safety" docs.)
+
+    build_options: extra options for build() (the tests use it to point at a local fake server)
+    """
+    per_thread = threading.local()
+
+    def http_for_this_thread():
+        if getattr(per_thread, "http", None) is None:
+            per_thread.http = google_auth_httplib2.AuthorizedHttp(credentials, http=build_http())
+        return per_thread.http
+
+    def build_request(_shared_http, *args, **kwargs):
+        return HttpRequest(http_for_this_thread(), *args, **kwargs)
+
+    return build('sheets', 'v4', http=http_for_this_thread(), requestBuilder=build_request, **build_options)
+
 
 class SheetsService:
     def __init__(self, credentials_file: str = None, sheet_id: str = None):
@@ -63,8 +181,8 @@ class SheetsService:
                 )
                 print(f"✅ Using Google credentials from file: {self.credentials_file}")
             
-            # Build the service
-            self.service = build('sheets', 'v4', credentials=credentials)
+            # Build the service (safe to use from several threads at once - see build_sheets_api)
+            self.service = build_sheets_api(credentials)
             print("✅ Google Sheets service initialized successfully!")
             
         except Exception as e:
@@ -78,41 +196,42 @@ class SheetsService:
     
     def create_headers_if_needed(self, sheet_name: str = "forms"):
         """
-        Create headers in the sheet if they don't exist
-        Headers: id | form name | form description | category | user_submitted
+        Create headers in the forms tab ONLY if the header row is completely empty.
+        An existing header row is never rewritten (even if its text differs from ours),
+        because the real column meaning is documented at the top of this file.
+        Headers for a new tab: id | form name | ukrainian name | description | group | user_submitted
         """
         try:
             if not self.sheet_id:
                 raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
             
             # Check if headers exist
-            range_name = f"{sheet_name}!A1:E1"
+            range_name = f"{sheet_name}!A1:F1"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
                 range=range_name
             ).execute()
             
             values = result.get('values', [])
-            expected_headers = ['id', 'form name', 'form description', 'category', 'user_submitted']
+            header_row = values[0] if values else []
+            header_is_empty = not any(str(cell).strip() for cell in header_row)
             
-            # If no headers or wrong headers, create them
-            if not values or values[0] != expected_headers:
-                headers = [expected_headers]
-                
+            # Only write headers into a completely empty first row
+            if header_is_empty:
                 body = {
-                    'values': headers
+                    'values': [DEFAULT_FORMS_HEADERS]
                 }
                 
                 self.service.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
-                    range=f"{sheet_name}!A1:E1",
+                    range=f"{sheet_name}!A1:F1",
                     valueInputOption='RAW',
                     body=body
                 ).execute()
                 
                 print("✅ Headers created in Google Sheet")
             else:
-                print("✅ Headers already exist")
+                print("✅ Headers already exist (left untouched)")
                 
         except HttpError as e:
             print(f"❌ HTTP Error creating headers: {e}")
@@ -121,15 +240,17 @@ class SheetsService:
             print(f"❌ Error creating headers: {str(e)}")
             raise
     
-    def add_form(self, form_name: str, form_description: str, category: str = "", user_submitted: bool = False, sheet_name: str = "forms") -> bool:
+    def add_form(self, form_name: str, ukrainian_name: str = "", description: str = "", group: str = "",
+                 user_submitted: bool = False, sheet_name: str = "forms") -> bool:
         """
-        Add a new form to the Google Sheet
+        Add a new form to the Google Sheet (writes columns A:F)
         
         Args:
-            form_name: Name of the form
-            form_description: Description of the form
-            category: Category of the form (optional)
-            user_submitted: Whether this is a user-submitted custom form (default: False)
+            form_name: Name of the form (column B)
+            ukrainian_name: Ukrainian translation of the name (column C, optional)
+            description: English description of the form's style (column D, optional)
+            group: Semantic group (column E, optional - "hidden" hides it from the website)
+            user_submitted: Whether this is a user-submitted custom form (column F, default: False)
             sheet_name: Name of the sheet tab (default: "forms")
             
         Returns:
@@ -142,26 +263,28 @@ class SheetsService:
             # Ensure headers exist
             self.create_headers_if_needed(sheet_name)
             
-            # Get next form ID
-            next_id = self._get_next_form_id(sheet_name)
+            # One writer at a time, so two new forms never get the same id
+            with _form_write_lock:
+                # Get next form ID
+                next_id = self._get_next_form_id(sheet_name)
             
-            # Prepare the data to append
-            values = [[next_id, form_name, form_description, category, user_submitted]]
+                # Prepare the data to append: id | name | ukrainian | description | group | user_submitted
+                values = [[next_id, form_name, ukrainian_name, description, group, user_submitted]]
             
-            body = {
-                'values': values
-            }
+                body = {
+                    'values': values
+                }
             
-            # Append the data to the sheet
-            result = self.service.spreadsheets().values().append(
-                spreadsheetId=self.sheet_id,
-                range=f"{sheet_name}!A:E",
-                valueInputOption='RAW',
-                insertDataOption='INSERT_ROWS',
-                body=body
-            ).execute()
+                # Append the data to the sheet
+                result = self.service.spreadsheets().values().append(
+                    spreadsheetId=self.sheet_id,
+                    range=f"{sheet_name}!A:F",
+                    valueInputOption='RAW',
+                    insertDataOption='INSERT_ROWS',
+                    body=body
+                ).execute()
             
-            print(f"✅ Form '{form_name}' added to Google Sheet (ID: {next_id}, User_submitted: {user_submitted})")
+            print(f"✅ Form '{form_name}' added to Google Sheet (ID: {next_id}, group: '{group}', user_submitted: {user_submitted})")
             return True
             
         except HttpError as e:
@@ -207,26 +330,33 @@ class SheetsService:
             return max_id + 1
             
         except Exception as e:
-            print(f"❌ Error getting next form ID: {str(e)}")
-            return 1
+            # Don't fall back to 1 (that is how we got two "PHILOSOPHY" rows with ids 1 and 2).
+            # A timestamp-based number is unique enough and easy to spot in the sheet.
+            fallback_id = int(time.time())
+            print(f"❌ Error getting next form ID: {str(e)} - using timestamp-based id {fallback_id} instead")
+            return fallback_id
     
-    def get_all_forms(self, sheet_name: str = "forms", include_user_submitted: bool = True) -> List[Dict[str, str]]:
+    def get_all_forms(self, sheet_name: str = "forms", include_user_submitted: bool = True,
+                      raise_errors: bool = False) -> List[Dict]:
         """
-        Get all forms from the Google Sheet
+        Get all forms from the Google Sheet (columns A:F, see the top of this file)
         
         Args:
             sheet_name: Name of the sheet tab (default: "forms")
             include_user_submitted: Whether to include user-submitted forms (default: True)
+            raise_errors: re-raise errors instead of returning [] (so callers can tell
+                          "the sheet is empty" apart from "we couldn't read the sheet")
             
         Returns:
-            List of dictionaries containing form data
+            List of dictionaries (in sheet order) with keys:
+            form_id, form_name, ukrainian_name, description, group, user_submitted, row_number
         """
         try:
             if not self.sheet_id:
                 raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
             
             # Get all data from the sheet
-            range_name = f"{sheet_name}!A:E"
+            range_name = f"{sheet_name}!A:F"
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
                 range=range_name
@@ -239,43 +369,33 @@ class SheetsService:
             
             # Skip header row and convert to list of dictionaries
             forms = []
-            for row in values[1:]:  # Skip header row
-                # Handle rows with missing columns
-                form_id = row[0] if len(row) > 0 else ""
-                form_name = row[1] if len(row) > 1 else ""
-                form_description = row[2] if len(row) > 2 else ""
-                category = row[3] if len(row) > 3 else ""
-                user_submitted = row[4] if len(row) > 4 else False
-                
-                # Convert user_submitted to boolean
-                if isinstance(user_submitted, str):
-                    user_submitted = user_submitted.lower() in ['true', '1', 'yes']
+            for index, row in enumerate(values[1:]):  # Skip header row
+                form = parse_form_row(row, sheet_row=index + 2)  # +2: sheet rows are 1-based and row 1 is the header
                 
                 # Filter based on include_user_submitted flag
-                if not include_user_submitted and user_submitted:
+                if not include_user_submitted and form['user_submitted']:
                     continue
                 
-                forms.append({
-                    'form_id': form_id,
-                    'form_name': form_name,
-                    'form_description': form_description,
-                    'category': category,
-                    'user_submitted': user_submitted
-                })
+                forms.append(form)
             
             print(f"✅ Retrieved {len(forms)} forms from Google Sheet (include_user_submitted: {include_user_submitted})")
             return forms
             
         except HttpError as e:
             print(f"❌ HTTP Error getting forms: {e}")
+            if raise_errors:
+                raise
             return []
         except Exception as e:
             print(f"❌ Error getting forms: {str(e)}")
+            if raise_errors:
+                raise
             return []
     
     def form_exists(self, form_name: str, sheet_name: str = "forms") -> bool:
         """
         Check if a form with the given name already exists
+        (ignores letter case and extra spaces: "Gen Z " counts as "gen z")
         
         Args:
             form_name: Name of the form to check
@@ -283,41 +403,47 @@ class SheetsService:
             
         Returns:
             bool: True if form exists, False otherwise
+
+        Raises:
+            Exception if the sheet can't be read (so we never add a duplicate "just in case")
         """
-        try:
-            forms = self.get_all_forms(sheet_name, include_user_submitted=True)
-            return any(form['form_name'].lower() == form_name.lower() for form in forms)
-        except Exception as e:
-            print(f"❌ Error checking if form exists: {str(e)}")
-            return False
+        wanted = normalize_form_name(form_name)
+        forms = self.get_all_forms(sheet_name, include_user_submitted=True, raise_errors=True)
+        return any(normalize_form_name(form['form_name']) == wanted for form in forms)
     
-    def add_custom_form(self, form_name: str, form_description: str = "", category: str = "", sheet_name: str = "forms") -> bool:
+    def add_custom_form(self, form_name: str, group: str = "", sheet_name: str = "forms") -> bool:
         """
-        Add a custom user-submitted form to the Google Sheet
+        Add a custom user-submitted form to the Google Sheet.
+        Written as: id | name | "" | "" | group | TRUE  (columns A:F)
         
         Args:
-            form_name: Name of the custom form
-            form_description: Description of the custom form (will be empty for custom forms)
-            category: Category of the form (will be empty for custom forms)
+            form_name: Name of the custom form (extra spaces are removed)
+            group: Semantic group for column E ("" if unknown, "hidden" to hide it)
             sheet_name: Name of the sheet tab (default: "forms")
             
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if successful (or the form already existed), False otherwise
         """
         try:
+            form_name = clean_form_name(form_name)
+            if not form_name:
+                print("⚠️ Refusing to add a custom form with an empty name")
+                return False
+
             # DEBUG: Log the form being added
-            print(f"🔍 DEBUG: Adding custom form - name: '{form_name}', description: '{form_description}', category: '{category}'")
+            print(f"🔍 DEBUG: Adding custom form - name: '{form_name}', group: '{group}'")
             
-            # Check if form already exists
+            # Check if form already exists (case/space-insensitive)
             if self.form_exists(form_name, sheet_name):
                 print(f"⚠️ Form '{form_name}' already exists, skipping creation")
                 return True
             
-            # Add the custom form with user_submitted=True and empty description/category
+            # Add the custom form with user_submitted=True and empty Ukrainian name / description
             result = self.add_form(
                 form_name=form_name,
-                form_description="",  # Empty description for custom forms
-                category="",  # Empty category for custom forms
+                ukrainian_name="",
+                description="",
+                group=group or "",
                 user_submitted=True,
                 sheet_name=sheet_name
             )
@@ -328,6 +454,44 @@ class SheetsService:
         except Exception as e:
             print(f"❌ Error adding custom form: {str(e)}")
             return False
+
+    def update_form_groups(self, groups_by_row: Dict[int, str], sheet_name: str = "forms") -> int:
+        """
+        Write semantic groups into column E ONLY (used by scripts/suggest_groups.py --apply).
+        Nothing else in the row is touched.
+
+        Args:
+            groups_by_row: {sheet_row_number: "group text"} (sheet rows are 1-based, header is row 1)
+            sheet_name: Name of the sheet tab (default: "forms")
+
+        Returns:
+            int: number of cells updated
+        """
+        if not self.sheet_id:
+            raise ValueError("Sheet ID not set. Use set_sheet_id() method.")
+        if not groups_by_row:
+            return 0
+
+        data = []
+        for sheet_row, group in sorted(groups_by_row.items()):
+            if int(sheet_row) < 2:
+                raise ValueError(f"Refusing to write into the header row (row {sheet_row})")
+            data.append({
+                'range': f"{sheet_name}!E{int(sheet_row)}",
+                'values': [[group]]
+            })
+
+        result = self.service.spreadsheets().values().batchUpdate(
+            spreadsheetId=self.sheet_id,
+            body={
+                'valueInputOption': 'RAW',
+                'data': data
+            }
+        ).execute()
+
+        updated = result.get('totalUpdatedCells', len(data))
+        print(f"✅ Updated {updated} group cells in column E")
+        return updated
     
     def update_form(self, row_number: int, form_name: str, form_description: str, category: str = "", sheet_name: str = "forms") -> bool:
         """
@@ -1292,6 +1456,22 @@ class SheetsService:
         except Exception as e:
             print(f"❌ Error adding interest record: {str(e)}")
             raise
+
+    def get_interest_timestamps(self, what: str, sheet_name: str = "interest_registered") -> List[str]:
+        """
+        The datetime texts of all interest rows for one kind of event (e.g. "image_converted").
+        Used to count today's photo translations after a restart (see ImageRateLimiter.seed_daily_count).
+        """
+        if not self.service or not self.sheet_id:
+            raise ValueError("Sheets service not initialized")
+
+        result = self.service.spreadsheets().values().get(
+            spreadsheetId=self.sheet_id,
+            range=f"{sheet_name}!A:C"
+        ).execute()
+
+        values = result.get('values', [])
+        return [str(row[2]) for row in values[1:] if len(row) >= 3 and str(row[1]).strip() == what]
 
 
 # Global instance - will be initialized in the routes
